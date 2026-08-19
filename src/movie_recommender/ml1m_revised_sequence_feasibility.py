@@ -129,12 +129,13 @@ class RevisedConfig:
     clear_win_epsilon: float = 0.01
     fast_test: bool = False
     fast_user_limit: int = 300
+    equal_timestamp_ordering_rule: str = "timestamp_movie_id_source"
 
     def serializable(self) -> dict[str, object]:
         values = asdict(self)
         values["data_dir"] = str(self.data_dir)
         values["output_dir"] = str(self.output_dir)
-        values["ordering_rule"] = "Timestamp ascending, then MovieID ascending"
+        values["ordering_rule"] = self.equal_timestamp_ordering_rule
         values["split_rule"] = (
             "test=max(2,floor(10%)); validation=max(2,floor(10%)); "
             "remainder training with minimum 5"
@@ -157,6 +158,7 @@ class RevisedSplit:
     summary: pd.DataFrame
     split_table: pd.DataFrame
     full_ratings: pd.DataFrame
+    ordering_columns: tuple[str, ...]
 
 
 @dataclass
@@ -251,9 +253,21 @@ def revised_chronological_split(
     config: RevisedConfig,
 ) -> RevisedSplit:
     """Create deterministic hybrid 80/10/10 positive-interaction blocks."""
+    ordering_rules = {
+        "timestamp_movie_id_source": ("Timestamp", "MovieID", "_source_order"),
+        "timestamp_source": ("Timestamp", "_source_order"),
+    }
+    try:
+        ordering_columns = ordering_rules[config.equal_timestamp_ordering_rule]
+    except KeyError as error:
+        raise ValueError(
+            "equal_timestamp_ordering_rule must be "
+            "'timestamp_movie_id_source' or 'timestamp_source'"
+        ) from error
     full = ratings.reset_index(names="_source_order").sort_values(
-        ["UserID", "Timestamp", "MovieID", "_source_order"], kind="mergesort"
+        ["UserID", *ordering_columns], kind="mergesort"
     )
+    full["_user_order_rank"] = full.groupby("UserID").cumcount()
     positives = full.loc[full["Rating"].ge(config.relevance_threshold)].copy()
     positive_counts = positives.groupby("UserID").size()
     all_users = np.sort(full["UserID"].unique())
@@ -333,37 +347,14 @@ def revised_chronological_split(
         labelled["split"] = label
         split_frames.append(labelled)
 
-    cutoff = (
-        train.sort_values(["Timestamp", "MovieID", "_source_order"])
-        .groupby("UserID")
-        .tail(1)[["UserID", "Timestamp", "MovieID", "_source_order"]]
-        .rename(
-            columns={
-                "Timestamp": "_cutoff_timestamp",
-                "MovieID": "_cutoff_movie",
-                "_source_order": "_cutoff_order",
-            }
-        )
+    cutoff = train.groupby("UserID", as_index=False)["_user_order_rank"].max().rename(
+        columns={"_user_order_rank": "_cutoff_rank"}
     )
     history = full.loc[full["UserID"].isin(selected_user_ids)].merge(
         cutoff, on="UserID", how="inner", validate="many_to_one"
     )
-    history = history.loc[
-        history["Timestamp"].lt(history["_cutoff_timestamp"])
-        | (
-            history["Timestamp"].eq(history["_cutoff_timestamp"])
-            & (
-                history["MovieID"].lt(history["_cutoff_movie"])
-                | (
-                    history["MovieID"].eq(history["_cutoff_movie"])
-                    & history["_source_order"].le(history["_cutoff_order"])
-                )
-            )
-        )
-    ].copy()
-    history = history.drop(
-        columns=["_cutoff_timestamp", "_cutoff_movie", "_cutoff_order"]
-    )
+    history = history.loc[history["_user_order_rank"].le(history["_cutoff_rank"])].copy()
+    history = history.drop(columns=["_cutoff_rank"])
 
     test_target_counts = eligible["test_target_count"]
     summary = pd.DataFrame(
@@ -405,6 +396,7 @@ def revised_chronological_split(
         summary=summary,
         split_table=pd.concat(split_frames, ignore_index=True),
         full_ratings=full,
+        ordering_columns=ordering_columns,
     )
 
 
@@ -414,10 +406,13 @@ def make_sequences(
     item_to_index: dict[int, int],
 ) -> list[np.ndarray]:
     """Convert positive interactions to stable zero-based item sequences."""
+    ordering_columns = (
+        ["_user_order_rank"]
+        if "_user_order_rank" in frame.columns
+        else ["Timestamp", "MovieID", "_source_order"]
+    )
     grouped = {
-        int(user_id): group.sort_values(
-            ["Timestamp", "MovieID", "_source_order"], kind="mergesort"
-        )
+        int(user_id): group.sort_values(ordering_columns, kind="mergesort")
         for user_id, group in frame.groupby("UserID", sort=False)
     }
     return [
@@ -434,9 +429,13 @@ def concatenate_blocks(
     second: pd.DataFrame,
 ) -> pd.DataFrame:
     """Combine chronological interaction blocks."""
-    return pd.concat([first, second], ignore_index=False).sort_values(
-        ["UserID", "Timestamp", "MovieID", "_source_order"], kind="mergesort"
+    combined = pd.concat([first, second], ignore_index=False)
+    ordering_columns = (
+        ["UserID", "_user_order_rank"]
+        if "_user_order_rank" in combined.columns
+        else ["UserID", "Timestamp", "MovieID", "_source_order"]
     )
+    return combined.sort_values(ordering_columns, kind="mergesort")
 
 
 def build_ranking_sets(
@@ -452,24 +451,11 @@ def build_ranking_sets(
     sets: dict[int, RankingSet] = {}
     rows: list[dict[str, object]] = []
     for user_id, target_group in targets.groupby("UserID", sort=True):
-        ordered_targets = target_group.sort_values(
-            ["Timestamp", "MovieID", "_source_order"], kind="mergesort"
-        )
+        ordered_targets = target_group.sort_values("_user_order_rank", kind="mergesort")
         first = ordered_targets.iloc[0]
         history = full_by_user[int(user_id)]
         observed = history.loc[
-            history["Timestamp"].lt(first["Timestamp"])
-            | (
-                history["Timestamp"].eq(first["Timestamp"])
-                & (
-                    history["MovieID"].lt(first["MovieID"])
-                    | (
-                        history["MovieID"].eq(first["MovieID"])
-                        & history["_source_order"].lt(first["_source_order"])
-                    )
-                )
-            ),
-            "MovieID",
+            history["_user_order_rank"].lt(first["_user_order_rank"]), "MovieID"
         ]
         relevant = set(int(item) for item in ordered_targets["MovieID"])
         observed_items = set(int(value) for value in observed)

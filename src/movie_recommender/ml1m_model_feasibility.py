@@ -122,6 +122,7 @@ class FPMC:
         learning_rate: float,
         regularization: float,
         seed: int,
+        sampling_seed: int | None = None,
     ) -> None:
         rng = np.random.default_rng(seed)
         scale = 0.05
@@ -138,6 +139,7 @@ class FPMC:
         self.learning_rate = learning_rate
         self.regularization = regularization
         self.seed = seed
+        self.sampling_seed = seed if sampling_seed is None else sampling_seed
 
     def fit(self, sequences: list[np.ndarray], epochs: int) -> FPMC:
         """Fit preference and first-order transition factors."""
@@ -156,7 +158,7 @@ class FPMC:
         users = np.asarray(transition_users, dtype=np.int32)
         previous_items = np.asarray(transition_previous, dtype=np.int32)
         next_items = np.asarray(transition_next, dtype=np.int32)
-        rng = np.random.default_rng(self.seed)
+        rng = np.random.default_rng(self.sampling_seed)
         item_count = self.item_preference_factors.shape[0]
 
         for _ in range(epochs):
