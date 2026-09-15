@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,7 @@ from movie_recommender.ml1m_revised_sequence_feasibility import (
     set_ranking_metrics,
 )
 from movie_recommender.ml1m_robustness import (
+    aggregate_matrix,
     build_matrix_specs,
     hierarchical_bootstrap,
 )
@@ -237,7 +239,9 @@ def test_sasrec_attention_is_causal() -> None:
     assert not torch.allclose(first_hidden[:, -1], changed_hidden[:, -1])
 
 
-def test_small_end_to_end_outputs_and_reproducibility(tmp_path: Path) -> None:
+def test_small_end_to_end_outputs_and_reproducibility(
+    tmp_path: Path, capsys
+) -> None:
     ratings, movies = _synthetic_data()
     first_dir = tmp_path / "first"
     second_dir = tmp_path / "second"
@@ -294,6 +298,27 @@ def test_small_end_to_end_outputs_and_reproducibility(tmp_path: Path) -> None:
     }
     assert metric_columns.issubset(first["per_user_model_metrics.csv"].columns)
     per_user = first["per_user_model_metrics.csv"]
+    assert set(per_user["model_name"]) == {
+        "popularity",
+        "item_knn",
+        "matrix_factorization",
+        "fpmc",
+        "lstm",
+        "sasrec",
+    }
+    configuration = json.loads((first_dir / "experiment_config.json").read_text())
+    environment = json.loads((first_dir / "environment_and_hardware.json").read_text())
+    selected = json.loads((first_dir / "selected_hyperparameters.json").read_text())
+    assert "lstm" in configuration["models"]
+    assert environment["execution_started_utc"].endswith("+00:00")
+    assert selected["lstm"]["embedding_dimension"] == 32
+    curves = first["training_curves.csv"]
+    lstm_final = curves.loc[
+        curves["run_label"].str.startswith("lstm_", na=False)
+        & curves["run_label"].str.contains("_init_", na=False)
+    ]
+    assert lstm_final["validation_evaluated"].eq(False).all()
+    assert "validation_ndcg=nan" not in capsys.readouterr().out
     candidate_counts = per_user.pivot_table(
         index="user_id",
         columns=["model_name", "order_condition"],
@@ -321,6 +346,45 @@ def test_small_end_to_end_outputs_and_reproducibility(tmp_path: Path) -> None:
             atol=1e-12,
         )
 
+    manifest = pd.DataFrame(
+        [
+            {
+                "run_id": "synthetic_rating4_ruleA_init760",
+                "relevance_definition": "rating_ge_4",
+                "relevance_threshold": 4.0,
+                "model_initialization_seed": 760,
+                "equal_timestamp_ordering_rule": "timestamp_movie_id_source",
+                "runtime_seconds": 1.0,
+                "output_directory": str(first_dir),
+                "completion_status": "complete",
+            },
+            {
+                "run_id": "synthetic_rating4_ruleB_init760",
+                "relevance_definition": "rating_ge_4",
+                "relevance_threshold": 4.0,
+                "model_initialization_seed": 760,
+                "equal_timestamp_ordering_rule": "timestamp_source",
+                "runtime_seconds": 1.0,
+                "output_directory": str(second_dir),
+                "completion_status": "complete",
+            },
+        ]
+    )
+    robustness = aggregate_matrix(manifest, tmp_path / "aggregate")
+    comparison = robustness["model_comparison.csv"]
+    assert {"fpmc", "lstm", "sasrec"}.issubset(set(comparison["model_name"]))
+    assert comparison[
+        ["original_ndcg_10", "fully_shuffled_ndcg_10"]
+    ].notna().all().all()
+    assert len(robustness["lstm_per_initialization_results.csv"]) == 1
+    assert (tmp_path / "aggregate" / "model_comparison.md").exists()
+    assert (
+        tmp_path
+        / "aggregate"
+        / "figures"
+        / "per_initialization_order_sensitivity.png"
+    ).exists()
+
 
 def test_hierarchical_bootstrap_and_matrix_specs_are_reproducible(
     tmp_path: Path,
@@ -342,3 +406,14 @@ def test_hierarchical_bootstrap_and_matrix_specs_are_reproducible(
     assert len(specs) == 7
     assert len({spec.run_id for spec in specs}) == len(specs)
     assert specs[0].reuse_existing
+
+    lstm_specs = build_matrix_specs(
+        tmp_path / "lstm-runs",
+        tmp_path / "lstm-primary",
+        (760, 761, 762, 763, 764),
+        model_names=("lstm",),
+    )
+    assert len(lstm_specs) == 7
+    assert all(spec.model_names == ("lstm",) for spec in lstm_specs)
+    assert all(spec.run_id.startswith("lstm_") for spec in lstm_specs)
+    assert not lstm_specs[0].reuse_existing

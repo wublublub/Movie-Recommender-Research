@@ -14,6 +14,7 @@ import tempfile
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
 
@@ -33,6 +34,12 @@ import torch
 from scipy.stats import wilcoxon
 from sklearn.decomposition import TruncatedSVD
 
+from movie_recommender.lstm_model import (
+    LSTMParameters,
+    LSTMRecommender,
+    lstm_score_matrix,
+    make_padded_batch,
+)
 from movie_recommender.ml1m_data_loader import (
     DEFAULT_ML1M_DATA_DIR,
     load_ml1m_movies,
@@ -65,8 +72,9 @@ DEFAULT_OUTPUT_DIR: Final = (
 ORIGINAL: Final = "original_order"
 FULL_SHUFFLE: Final = "fully_shuffled_pretest"
 RECENT_FIXED: Final = "recent_context_fixed_shuffle"
-SEQUENTIAL_MODELS: Final = ("fpmc", "sasrec")
+SEQUENTIAL_MODELS: Final = ("fpmc", "lstm", "sasrec")
 NON_SEQUENTIAL_MODELS: Final = ("popularity", "item_knn", "matrix_factorization")
+ALL_MODELS: Final = NON_SEQUENTIAL_MODELS + SEQUENTIAL_MODELS
 METRICS: Final = (
     "precision_10",
     "recall_10",
@@ -96,10 +104,26 @@ class OrderExperimentConfig:
     maximum_epochs: int = 5
     patience: int = 2
     batch_size: int = 128
+    lstm_batch_size: int = 32
+    lstm_embedding_dimension: int = 32
+    lstm_hidden_dimension: int = 32
+    lstm_maximum_sequence_length: int = 64
+    lstm_learning_rate: float = 0.001
     bootstrap_samples: int = 1_000
     fast_test: bool = False
     fast_user_limit: int = 120
     equal_timestamp_ordering_rule: str = "timestamp_movie_id_source"
+    models: tuple[str, ...] = ALL_MODELS
+
+    def __post_init__(self) -> None:
+        """Reject empty, duplicate, or unknown model selections."""
+        unknown = set(self.models) - set(ALL_MODELS)
+        if unknown:
+            raise ValueError(f"Unknown model names: {sorted(unknown)}")
+        if not self.models:
+            raise ValueError("At least one model must be selected")
+        if len(set(self.models)) != len(self.models):
+            raise ValueError("Model names must be unique")
 
     def serializable(self) -> dict[str, object]:
         """Return JSON-compatible configuration and protocol declarations."""
@@ -108,6 +132,7 @@ class OrderExperimentConfig:
         values["output_dir"] = str(self.output_dir)
         values["model_initialization_seeds"] = list(self.model_initialization_seeds)
         values["sequence_shuffle_seeds"] = list(self.sequence_shuffle_seeds)
+        values["models"] = list(self.models)
         values["run_kind"] = (
             "non_final_smoke_test" if self.fast_test else "formal_experiment"
         )
@@ -648,6 +673,216 @@ def _evaluate_sasrec_conditions(
     return pd.concat(metric_rows, ignore_index=True), pd.DataFrame(training_rows)
 
 
+def _train_lstm_controlled(
+    sequences: list[np.ndarray],
+    validation_sets: dict[int, RankingSet] | None,
+    user_ids: np.ndarray,
+    item_to_index: dict[int, int],
+    item_count: int,
+    parameters: LSTMParameters,
+    config: OrderExperimentConfig,
+    device: torch.device,
+    initialization_seed: int,
+    run_label: str,
+    fixed_epochs: int | None = None,
+) -> tuple[LSTMRecommender, list[dict[str, object]], int, float]:
+    """Train one deterministic LSTM condition with optional validation."""
+    set_deterministic_seed(initialization_seed)
+    model = LSTMRecommender(
+        item_count,
+        parameters.embedding_dimension,
+        parameters.hidden_dimension,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=parameters.learning_rate)
+    loss_function = torch.nn.CrossEntropyLoss(ignore_index=-100)
+    maximum_epochs = fixed_epochs or (
+        min(2, config.maximum_epochs) if config.fast_test else config.maximum_epochs
+    )
+    best_epoch = maximum_epochs
+    best_score = -np.inf
+    best_state: dict[str, torch.Tensor] | None = None
+    stale = 0
+    rows: list[dict[str, object]] = []
+    for epoch in range(1, maximum_epochs + 1):
+        epoch_started = time.perf_counter()
+        order = np.random.default_rng(initialization_seed + epoch).permutation(
+            len(sequences)
+        )
+        model.train()
+        losses: list[float] = []
+        for start in range(0, len(order), config.lstm_batch_size):
+            indices = order[start : start + config.lstm_batch_size]
+            batch_sequences = [sequences[int(index)] for index in indices]
+            inputs, targets, _ = make_padded_batch(
+                batch_sequences, parameters.maximum_sequence_length
+            )
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            optimizer.zero_grad()
+            scores = model(inputs)
+            loss = loss_function(scores.reshape(-1, item_count), targets.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+
+        validation_ndcg: float | None = None
+        if validation_sets is not None:
+            score_matrix = lstm_score_matrix(
+                model,
+                sequences,
+                config.lstm_batch_size,
+                parameters.maximum_sequence_length,
+                device,
+            )
+            validation_metrics = evaluate_full_ranker(
+                "lstm_validation",
+                validation_sets,
+                user_ids,
+                item_to_index,
+                lambda user, candidates: score_matrix[user, candidates],
+            )
+            validation_ndcg = float(validation_metrics["ndcg_10"].mean())
+            if validation_ndcg > best_score + 1e-5:
+                best_score = validation_ndcg
+                best_epoch = epoch
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                }
+                stale = 0
+            else:
+                stale += 1
+            validation_message = f"validation_ndcg={validation_ndcg:.4f}"
+        else:
+            validation_message = "validation=not_run (fixed-epoch final fit)"
+        rows.append(
+            {
+                "run_label": run_label,
+                "epoch": epoch,
+                "training_loss": float(np.mean(losses)),
+                "validation_ndcg_10": validation_ndcg,
+                "validation_evaluated": validation_sets is not None,
+                "model_initialization_seed": initialization_seed,
+                "negative_sampling_seed": np.nan,
+                "epoch_runtime_seconds": time.perf_counter() - epoch_started,
+            }
+        )
+        print(
+            f"LSTM {run_label} epoch {epoch} | loss={np.mean(losses):.4f} | "
+            f"{validation_message}"
+        )
+        if validation_sets is not None and stale >= config.patience:
+            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    reported_score = float(best_score) if validation_sets is not None else np.nan
+    return model, rows, best_epoch, reported_score
+
+
+def _tune_lstm(
+    histories: OrderHistories,
+    validation_sets: dict[int, RankingSet],
+    user_ids: np.ndarray,
+    item_to_index: dict[int, int],
+    item_count: int,
+    config: OrderExperimentConfig,
+    device: torch.device,
+) -> tuple[LSTMParameters, int, list[dict[str, object]], list[dict[str, object]]]:
+    """Select the LSTM epoch count on original-order validation data."""
+    parameters = LSTMParameters(
+        embedding_dimension=config.lstm_embedding_dimension,
+        hidden_dimension=config.lstm_hidden_dimension,
+        maximum_sequence_length=config.lstm_maximum_sequence_length,
+        learning_rate=config.lstm_learning_rate,
+    )
+    model, curves, best_epoch, score = _train_lstm_controlled(
+        histories.training,
+        validation_sets,
+        user_ids,
+        item_to_index,
+        item_count,
+        parameters,
+        config,
+        device,
+        config.model_initialization_seeds[0],
+        "lstm_tuning",
+    )
+    del model
+    validation = [
+        {
+            "model_name": "lstm",
+            "parameters": json.dumps(asdict(parameters)),
+            "best_epoch": best_epoch,
+            "validation_ndcg_10": score,
+            "model_initialization_seed": config.model_initialization_seeds[0],
+            "negative_sampling_seed": np.nan,
+        }
+    ]
+    return parameters, best_epoch, validation, curves
+
+
+def _evaluate_lstm_conditions(
+    histories: OrderHistories,
+    test_sets: dict[int, RankingSet],
+    user_ids: np.ndarray,
+    item_to_index: dict[int, int],
+    item_count: int,
+    parameters: LSTMParameters,
+    epochs: int,
+    config: OrderExperimentConfig,
+    device: torch.device,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fit and evaluate LSTM under every shared order condition and seed."""
+    metric_rows: list[pd.DataFrame] = []
+    training_rows: list[dict[str, object]] = []
+    conditions = [(ORIGINAL, None)] + [
+        (condition, seed)
+        for condition in (FULL_SHUFFLE, RECENT_FIXED)
+        for seed in config.sequence_shuffle_seeds
+    ]
+    for init_seed in config.model_initialization_seeds:
+        for condition, shuffle_seed in conditions:
+            sequences = _condition_sequences(histories, condition, shuffle_seed)
+            label = f"lstm_{condition}_init_{init_seed}_shuffle_{shuffle_seed}"
+            model, rows, _, _ = _train_lstm_controlled(
+                sequences,
+                None,
+                user_ids,
+                item_to_index,
+                item_count,
+                parameters,
+                config,
+                device,
+                init_seed,
+                label,
+                fixed_epochs=epochs,
+            )
+            training_rows.extend(rows)
+            scores = lstm_score_matrix(
+                model,
+                sequences,
+                config.lstm_batch_size,
+                parameters.maximum_sequence_length,
+                device,
+            )
+            metrics = evaluate_full_ranker(
+                f"lstm_{condition}",
+                test_sets,
+                user_ids,
+                item_to_index,
+                lambda user, candidates: scores[user, candidates],
+            )
+            metrics["model_name"] = "lstm"
+            metrics["order_condition"] = condition
+            metrics["model_initialization_seed"] = init_seed
+            metrics["negative_sampling_seed"] = np.nan
+            metrics["sequence_shuffle_seed"] = shuffle_seed
+            metric_rows.append(metrics)
+            del model, scores
+    return pd.concat(metric_rows, ignore_index=True), pd.DataFrame(training_rows)
+
+
 def _bootstrap_interval(
     values: np.ndarray, samples: int, seed: int
 ) -> tuple[float, float]:
@@ -1001,8 +1236,10 @@ def _write_plots(
     plt.close(fig)
 
     primary = paired.loc[paired["order_condition"].eq(FULL_SHUFFLE)]
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    for axis, model_name in zip(axes, SEQUENTIAL_MODELS, strict=True):
+    plotted_models = tuple(primary["model_name"].drop_duplicates())
+    fig, axes = plt.subplots(1, len(plotted_models), figsize=(5.5 * len(plotted_models), 4))
+    axes = np.atleast_1d(axes)
+    for axis, model_name in zip(axes, plotted_models, strict=True):
         axis.hist(
             primary.loc[primary["model_name"].eq(model_name), "paired_difference_ndcg_10"],
             bins=35,
@@ -1051,7 +1288,10 @@ def _create_report(
         "The primary outcome is paired user-level original-order NDCG@10 minus fully shuffled pre-test NDCG@10. Positive values favor recorded rating-submission order.",
         "",
     ]
-    for model in SEQUENTIAL_MODELS:
+    reported_models = tuple(
+        model for model in SEQUENTIAL_MODELS if model in set(statistical["model_name"])
+    )
+    for model in reported_models:
         result = statistical.loc[
             statistical["model_name"].eq(model)
             & statistical["intervention"].eq(FULL_SHUFFLE)
@@ -1068,7 +1308,7 @@ def _create_report(
             "",
         ]
     )
-    for model in SEQUENTIAL_MODELS:
+    for model in reported_models:
         result = statistical.loc[
             statistical["model_name"].eq(model)
             & statistical["intervention"].eq(RECENT_FIXED)
@@ -1125,7 +1365,10 @@ def _validate_result_rows(
     expected_sequential_runs = len(config.model_initialization_seeds) * (
         1 + 2 * len(config.sequence_shuffle_seeds)
     )
-    for model in SEQUENTIAL_MODELS:
+    selected_sequential = tuple(
+        model for model in SEQUENTIAL_MODELS if model in config.models
+    )
+    for model in selected_sequential:
         rows = per_user.loc[per_user["model_name"].eq(model)]
         if len(rows) != len(expected_users) * expected_sequential_runs:
             raise AssertionError(f"Incomplete result grid for {model}")
@@ -1138,6 +1381,7 @@ def run_experiment(
 ) -> dict[str, pd.DataFrame]:
     """Run the controlled order experiment and write self-contained artifacts."""
     started = time.perf_counter()
+    started_utc = datetime.now(timezone.utc).isoformat()
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1162,66 +1406,127 @@ def run_experiment(
         split, user_ids, item_to_index, config.sequence_shuffle_seeds
     )
 
-    nonseq, nonseq_parameters = _evaluate_non_sequential(
-        histories, test_sets, user_ids, item_to_index, len(movie_ids), config
+    result_frames: list[pd.DataFrame] = []
+    validation_rows: list[dict[str, object]] = []
+    training_curve_frames: list[pd.DataFrame] = []
+    selected: dict[str, object] = {}
+
+    selected_non_sequential = tuple(
+        model for model in NON_SEQUENTIAL_MODELS if model in config.models
     )
-    fpmc_parameters, fpmc_validation = _tune_fpmc(
-        histories,
-        validation_sets,
-        user_ids,
-        item_to_index,
-        len(movie_ids),
-        config,
-    )
-    sasrec_parameters, sasrec_epochs, sasrec_validation, tuning_curves = _tune_sasrec(
-        histories,
-        validation_sets,
-        user_ids,
-        item_to_index,
-        len(movie_ids),
-        config,
-        device,
-    )
-    fpmc = _evaluate_fpmc_conditions(
-        histories,
-        test_sets,
-        user_ids,
-        item_to_index,
-        len(movie_ids),
-        fpmc_parameters,
-        config,
-    )
-    sasrec, final_curves = _evaluate_sasrec_conditions(
-        histories,
-        test_sets,
-        user_ids,
-        item_to_index,
-        len(movie_ids),
-        sasrec_parameters,
-        sasrec_epochs,
-        config,
-        device,
-    )
-    per_user = pd.concat([nonseq, fpmc, sasrec], ignore_index=True)
+    if selected_non_sequential:
+        nonseq, nonseq_parameters = _evaluate_non_sequential(
+            histories, test_sets, user_ids, item_to_index, len(movie_ids), config
+        )
+        result_frames.append(
+            nonseq.loc[nonseq["model_name"].isin(selected_non_sequential)].copy()
+        )
+        selected.update(
+            {
+                name: parameters
+                for name, parameters in nonseq_parameters.items()
+                if name in selected_non_sequential
+            }
+        )
+
+    if "fpmc" in config.models:
+        fpmc_parameters, fpmc_validation = _tune_fpmc(
+            histories,
+            validation_sets,
+            user_ids,
+            item_to_index,
+            len(movie_ids),
+            config,
+        )
+        result_frames.append(
+            _evaluate_fpmc_conditions(
+                histories,
+                test_sets,
+                user_ids,
+                item_to_index,
+                len(movie_ids),
+                fpmc_parameters,
+                config,
+            )
+        )
+        validation_rows.extend(fpmc_validation)
+        selected["fpmc"] = fpmc_parameters
+
+    if "lstm" in config.models:
+        lstm_parameters, lstm_epochs, lstm_validation, lstm_tuning_curves = (
+            _tune_lstm(
+                histories,
+                validation_sets,
+                user_ids,
+                item_to_index,
+                len(movie_ids),
+                config,
+                device,
+            )
+        )
+        lstm, lstm_final_curves = _evaluate_lstm_conditions(
+            histories,
+            test_sets,
+            user_ids,
+            item_to_index,
+            len(movie_ids),
+            lstm_parameters,
+            lstm_epochs,
+            config,
+            device,
+        )
+        result_frames.append(lstm)
+        validation_rows.extend(lstm_validation)
+        training_curve_frames.extend(
+            [pd.DataFrame(lstm_tuning_curves), lstm_final_curves]
+        )
+        selected["lstm"] = {**asdict(lstm_parameters), "epochs": lstm_epochs}
+
+    if "sasrec" in config.models:
+        sasrec_parameters, sasrec_epochs, sasrec_validation, tuning_curves = (
+            _tune_sasrec(
+                histories,
+                validation_sets,
+                user_ids,
+                item_to_index,
+                len(movie_ids),
+                config,
+                device,
+            )
+        )
+        sasrec, final_curves = _evaluate_sasrec_conditions(
+            histories,
+            test_sets,
+            user_ids,
+            item_to_index,
+            len(movie_ids),
+            sasrec_parameters,
+            sasrec_epochs,
+            config,
+            device,
+        )
+        result_frames.append(sasrec)
+        validation_rows.extend(sasrec_validation)
+        training_curve_frames.extend([pd.DataFrame(tuning_curves), final_curves])
+        selected["sasrec"] = {**asdict(sasrec_parameters), "epochs": sasrec_epochs}
+
+    per_user = pd.concat(result_frames, ignore_index=True)
     _validate_result_rows(per_user, split.eligible_users, config)
     aggregate = aggregate_model_metrics(per_user, config)
     paired, seed_results, statistics = paired_order_results(per_user, config)
     features = _pretest_sensitivity_features(split, histories, user_ids)
     sensitivity = _sensitivity_results(paired, features)
     minimum_history = _minimum_history_sensitivity(ratings_frame, config)
-    validation_results = pd.DataFrame(fpmc_validation + sasrec_validation)
-    training_curves = pd.concat(
-        [pd.DataFrame(tuning_curves), final_curves], ignore_index=True
+    validation_results = pd.DataFrame(validation_rows)
+    training_curves = (
+        pd.concat(training_curve_frames, ignore_index=True)
+        if training_curve_frames
+        else pd.DataFrame()
     )
-    selected = {
-        **nonseq_parameters,
-        "fpmc": fpmc_parameters,
-        "sasrec": {**asdict(sasrec_parameters), "epochs": sasrec_epochs},
-        "selection_protocol": (
-            "Selected on original-order validation only, then held fixed across all "
-            "test order conditions to isolate order effects"
-        ),
-    }
+    selected["selection_protocol"] = (
+        "Selected on original-order validation only, then held fixed across all "
+        "test order conditions to isolate order effects"
+    )
 
     split_audit = split.split_table.copy()
     split_audit["is_test_untouched"] = split_audit["split"].eq("test")
@@ -1265,8 +1570,15 @@ def run_experiment(
                 "numerical_tolerance": 0.0,
                 "invariant": True,
             }
-            for model_name in NON_SEQUENTIAL_MODELS
-        ]
+            for model_name in selected_non_sequential
+        ],
+        columns=[
+            "model_name",
+            "comparison",
+            "maximum_absolute_difference",
+            "numerical_tolerance",
+            "invariant",
+        ],
     )
 
     files: dict[str, pd.DataFrame] = {
@@ -1315,6 +1627,7 @@ def run_experiment(
         encoding="utf-8",
     )
     environment = _environment_metadata(device)
+    environment["execution_started_utc"] = started_utc
     environment["random_seeds"] = {
         "model_initialization": list(config.model_initialization_seeds),
         "negative_sampling": config.negative_sampling_seed,
@@ -1333,6 +1646,18 @@ def _parse_int_tuple(value: str) -> tuple[int, ...]:
     parsed = tuple(int(item.strip()) for item in value.split(",") if item.strip())
     if not parsed:
         raise argparse.ArgumentTypeError("At least one integer seed is required")
+    return parsed
+
+
+def _parse_model_tuple(value: str) -> tuple[str, ...]:
+    parsed = tuple(item.strip().lower() for item in value.split(",") if item.strip())
+    unknown = set(parsed) - set(ALL_MODELS)
+    if not parsed:
+        raise argparse.ArgumentTypeError("At least one model is required")
+    if unknown:
+        raise argparse.ArgumentTypeError(f"Unknown models: {sorted(unknown)}")
+    if len(set(parsed)) != len(parsed):
+        raise argparse.ArgumentTypeError("Model names must be unique")
     return parsed
 
 
@@ -1361,6 +1686,11 @@ def parse_args() -> OrderExperimentConfig:
     parser.add_argument("--maximum-epochs", type=int, default=5)
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--lstm-batch-size", type=int, default=32)
+    parser.add_argument("--lstm-embedding-dimension", type=int, default=32)
+    parser.add_argument("--lstm-hidden-dimension", type=int, default=32)
+    parser.add_argument("--lstm-maximum-sequence-length", type=int, default=64)
+    parser.add_argument("--lstm-learning-rate", type=float, default=0.001)
     parser.add_argument("--bootstrap-samples", type=int, default=1_000)
     parser.add_argument("--fast-test", action="store_true")
     parser.add_argument("--fast-user-limit", type=int, default=120)
@@ -1368,6 +1698,12 @@ def parse_args() -> OrderExperimentConfig:
         "--equal-timestamp-ordering-rule",
         choices=("timestamp_movie_id_source", "timestamp_source"),
         default="timestamp_movie_id_source",
+    )
+    parser.add_argument(
+        "--models",
+        type=_parse_model_tuple,
+        default=ALL_MODELS,
+        help="Comma-separated model names to execute through the shared pipeline",
     )
     arguments = parser.parse_args()
     return OrderExperimentConfig(
@@ -1388,10 +1724,16 @@ def parse_args() -> OrderExperimentConfig:
         maximum_epochs=arguments.maximum_epochs,
         patience=arguments.patience,
         batch_size=arguments.batch_size,
+        lstm_batch_size=arguments.lstm_batch_size,
+        lstm_embedding_dimension=arguments.lstm_embedding_dimension,
+        lstm_hidden_dimension=arguments.lstm_hidden_dimension,
+        lstm_maximum_sequence_length=arguments.lstm_maximum_sequence_length,
+        lstm_learning_rate=arguments.lstm_learning_rate,
         bootstrap_samples=arguments.bootstrap_samples,
         fast_test=arguments.fast_test,
         fast_user_limit=arguments.fast_user_limit,
         equal_timestamp_ordering_rule=arguments.equal_timestamp_ordering_rule,
+        models=arguments.models,
     )
 
 

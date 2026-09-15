@@ -1,8 +1,8 @@
 import numpy as np
 import torch
 
-from movie_recommender.lstm_model import LSTMRecommender
-from movie_recommender.ml1m_lstm_experiment import (
+from movie_recommender.lstm_model import (
+    LSTMRecommender,
     make_history_batch,
     make_padded_batch,
 )

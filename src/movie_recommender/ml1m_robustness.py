@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from movie_recommender.ml1m_order_experiment import (
+    ALL_MODELS,
     FULL_SHUFFLE,
     ORIGINAL,
     RECENT_FIXED,
@@ -44,7 +45,7 @@ REQUIRED_RUN_FILES: Final = (
     "statistical_comparisons.csv",
     "report.md",
 )
-SEQUENTIAL_MODELS: Final = ("fpmc", "sasrec")
+SEQUENTIAL_MODELS: Final = ("fpmc", "lstm", "sasrec")
 
 
 @dataclass(frozen=True)
@@ -57,11 +58,15 @@ class MatrixSpec:
     model_initialization_seed: int
     equal_timestamp_ordering_rule: str
     output_dir: Path
+    model_names: tuple[str, ...] = ("fpmc", "sasrec")
     reuse_existing: bool = False
 
 
-def _is_complete(output_dir: Path) -> bool:
-    return all((output_dir / filename).exists() for filename in REQUIRED_RUN_FILES)
+def _is_complete(output_dir: Path, model_names: tuple[str, ...]) -> bool:
+    if not all((output_dir / filename).exists() for filename in REQUIRED_RUN_FILES):
+        return False
+    metrics = pd.read_csv(output_dir / "per_user_model_metrics.csv", usecols=["model_name"])
+    return set(model_names).issubset(set(metrics["model_name"]))
 
 
 def build_matrix_specs(
@@ -70,13 +75,15 @@ def build_matrix_specs(
     initialization_seeds: tuple[int, ...],
     include_rating3: bool = True,
     include_rule_b: bool = True,
+    model_names: tuple[str, ...] = ("fpmc", "sasrec"),
 ) -> list[MatrixSpec]:
     """Build the pre-specified robustness matrix without duplicate cells."""
     specs = []
+    prefix = "" if model_names == ("fpmc", "sasrec") else f"{'_'.join(model_names)}_"
     for seed in initialization_seeds:
         specs.append(
             MatrixSpec(
-                run_id=f"rating4_ruleA_init{seed}",
+                run_id=f"{prefix}rating4_ruleA_init{seed}",
                 relevance_label="rating_ge_4",
                 relevance_threshold=4.0,
                 model_initialization_seed=seed,
@@ -84,31 +91,34 @@ def build_matrix_specs(
                 output_dir=(
                     primary_result_dir
                     if seed == 760
-                    else runs_dir / f"rating4_ruleA_init{seed}"
+                    else runs_dir / f"{prefix}rating4_ruleA_init{seed}"
                 ),
-                reuse_existing=seed == 760,
+                model_names=model_names,
+                reuse_existing=seed == 760 and model_names == ("fpmc", "sasrec"),
             )
         )
     if include_rating3:
         specs.append(
             MatrixSpec(
-                run_id="rating3_ruleA_init760",
+                run_id=f"{prefix}rating3_ruleA_init760",
                 relevance_label="rating_ge_3",
                 relevance_threshold=3.0,
                 model_initialization_seed=760,
                 equal_timestamp_ordering_rule="timestamp_movie_id_source",
-                output_dir=runs_dir / "rating3_ruleA_init760",
+                output_dir=runs_dir / f"{prefix}rating3_ruleA_init760",
+                model_names=model_names,
             )
         )
     if include_rule_b:
         specs.append(
             MatrixSpec(
-                run_id="rating4_ruleB_init760",
+                run_id=f"{prefix}rating4_ruleB_init760",
                 relevance_label="rating_ge_4",
                 relevance_threshold=4.0,
                 model_initialization_seed=760,
                 equal_timestamp_ordering_rule="timestamp_source",
-                output_dir=runs_dir / "rating4_ruleB_init760",
+                output_dir=runs_dir / f"{prefix}rating4_ruleB_init760",
+                model_names=model_names,
             )
         )
     return specs
@@ -131,6 +141,7 @@ def _manifest_row(
         "split_seed": 40_760,
         "equal_timestamp_ordering_rule": spec.equal_timestamp_ordering_rule,
         "order_conditions": f"{ORIGINAL}|{FULL_SHUFFLE}|{RECENT_FIXED}",
+        "models": "|".join(spec.model_names),
         "run_kind": "formal_experiment",
         "git_commit": None,
         "working_tree_dirty": None,
@@ -168,7 +179,7 @@ def run_matrix(
     rows = [_manifest_row(spec, "pending") for spec in specs]
     completed_new_runs = 0
     for index, spec in enumerate(specs):
-        if _is_complete(spec.output_dir):
+        if _is_complete(spec.output_dir, spec.model_names):
             rows[index] = _enrich_completed_row(rows[index])
             pd.DataFrame(rows).to_csv(manifest_path, index=False)
             continue
@@ -194,6 +205,7 @@ def run_matrix(
                     patience=2,
                     bootstrap_samples=1_000,
                     equal_timestamp_ordering_rule=spec.equal_timestamp_ordering_rule,
+                    models=spec.model_names,
                 )
             )
             rows[index] = _enrich_completed_row(rows[index])
@@ -363,7 +375,13 @@ def _threshold_sensitivity(
         aggregate = pd.read_csv(output_dir / "aggregate_model_metrics.csv")
         statistics = pd.read_csv(output_dir / "statistical_comparisons.csv")
         split_audit = pd.read_csv(output_dir / "split_audit_table.csv")
-        for model_name in SEQUENTIAL_MODELS:
+        available_models = tuple(
+            model
+            for model in SEQUENTIAL_MODELS
+            if model in set(aggregate["model_name"])
+            and model in set(statistics["model_name"])
+        )
+        for model_name in available_models:
             model_aggregate = aggregate.loc[
                 aggregate["model_name"].eq(model_name)
                 & aggregate["metric"].eq("ndcg_10")
@@ -454,6 +472,7 @@ def _timestamp_tie_sensitivity(
     ]
     rows = []
     target_maps: dict[str, pd.Series] = {}
+    rule_target_maps: dict[str, pd.Series] = {}
     affected: dict[str, tuple[int, int]] = {}
     for _, manifest_row in selected.iterrows():
         output_dir = Path(manifest_row["output_directory"])
@@ -466,6 +485,12 @@ def _timestamp_tie_sensitivity(
             lambda values: "|".join(str(value) for value in sorted(values))
         )
         target_maps[str(manifest_row["run_id"])] = targets
+        rule = str(manifest_row["equal_timestamp_ordering_rule"])
+        if rule in rule_target_maps and not rule_target_maps[rule].equals(targets):
+            raise AssertionError(
+                f"Equivalent {rule} runs produced different held-out targets"
+            )
+        rule_target_maps[rule] = targets
         run_effects = per_user_comparisons.loc[
             per_user_comparisons["run_id"].eq(manifest_row["run_id"])
         ]
@@ -494,20 +519,22 @@ def _timestamp_tie_sensitivity(
     eligibility_changed_users = np.nan
     target_changed_users = np.nan
     target_changed_percentage = np.nan
-    if len(target_maps) == 2:
-        first_id, second_id = target_maps
-        common_users = target_maps[first_id].index.intersection(target_maps[second_id].index)
+    if len(rule_target_maps) == 2:
+        first_rule, second_rule = rule_target_maps
+        first_targets = rule_target_maps[first_rule]
+        second_targets = rule_target_maps[second_rule]
+        common_users = first_targets.index.intersection(second_targets.index)
         common_targets = common_users[
-            target_maps[first_id].loc[common_users].to_numpy()
-            == target_maps[second_id].loc[common_users].to_numpy()
+            first_targets.loc[common_users].to_numpy()
+            == second_targets.loc[common_users].to_numpy()
         ]
         eligibility_changed_users = len(
-            target_maps[first_id].index.symmetric_difference(target_maps[second_id].index)
+            first_targets.index.symmetric_difference(second_targets.index)
         )
         target_changed_users = len(common_users) - len(common_targets)
         target_changed_percentage = target_changed_users / len(common_users) * 100
-        for run_id in (first_id, second_id):
-            manifest_row = selected.loc[selected["run_id"].eq(run_id)].iloc[0]
+        for _, manifest_row in selected.iterrows():
+            run_id = str(manifest_row["run_id"])
             frame = per_user_comparisons.loc[
                 per_user_comparisons["run_id"].eq(run_id)
                 & per_user_comparisons["user_id"].isin(common_targets)
@@ -586,10 +613,180 @@ def _seed_level_results(complete_manifest: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def _model_comparison(
+    complete_manifest: pd.DataFrame, robustness: pd.DataFrame
+) -> pd.DataFrame:
+    """Build a common primary-result table without inventing missing model rows."""
+    primary_runs = complete_manifest.loc[
+        complete_manifest["relevance_definition"].eq("rating_ge_4")
+        & complete_manifest["equal_timestamp_ordering_rule"].eq(
+            "timestamp_movie_id_source"
+        )
+    ]
+    rows: list[dict[str, object]] = []
+    for _, manifest_row in primary_runs.iterrows():
+        aggregate = pd.read_csv(
+            Path(manifest_row["output_directory"]) / "aggregate_model_metrics.csv"
+        )
+        ndcg = aggregate.loc[aggregate["metric"].eq("ndcg_10")]
+        for model_name, model_frame in ndcg.groupby("model_name"):
+            values = model_frame.set_index("order_condition")["mean"]
+            if ORIGINAL in values and FULL_SHUFFLE in values:
+                original = float(values[ORIGINAL])
+                shuffled = float(values[FULL_SHUFFLE])
+            elif "not_applicable_order_invariant" in values:
+                original = shuffled = float(values["not_applicable_order_invariant"])
+            else:
+                continue
+            rows.append(
+                {
+                    "run_id": manifest_row["run_id"],
+                    "model_name": model_name,
+                    "model_initialization_seed": int(
+                        manifest_row["model_initialization_seed"]
+                    ),
+                    "original_ndcg_10": original,
+                    "fully_shuffled_ndcg_10": shuffled,
+                    "original_minus_fully_shuffled": original - shuffled,
+                }
+            )
+    run_table = pd.DataFrame(rows)
+    if run_table.empty:
+        return run_table
+    comparison = (
+        run_table.groupby("model_name")
+        .agg(
+            original_ndcg_10=("original_ndcg_10", "mean"),
+            fully_shuffled_ndcg_10=("fully_shuffled_ndcg_10", "mean"),
+            original_minus_fully_shuffled=(
+                "original_minus_fully_shuffled",
+                "mean",
+            ),
+            initialization_run_count=("run_id", "nunique"),
+        )
+        .reset_index()
+    )
+    primary_effects = robustness.loc[
+        robustness["comparison"].eq("original_minus_fully_shuffled"),
+        ["model_name", "hierarchical_ci_95_lower", "hierarchical_ci_95_upper"],
+    ]
+    comparison = comparison.merge(primary_effects, on="model_name", how="left")
+    static = comparison["model_name"].isin(
+        ["popularity", "item_knn", "matrix_factorization"]
+    )
+    comparison.loc[static, ["hierarchical_ci_95_lower", "hierarchical_ci_95_upper"]] = 0.0
+    return comparison
+
+
+def _lstm_per_initialization(complete_manifest: pd.DataFrame) -> pd.DataFrame:
+    """Collect primary LSTM outcomes and paired tests for every initialization."""
+    rows: list[dict[str, object]] = []
+    primary = complete_manifest.loc[
+        complete_manifest["relevance_definition"].eq("rating_ge_4")
+        & complete_manifest["equal_timestamp_ordering_rule"].eq(
+            "timestamp_movie_id_source"
+        )
+    ]
+    for _, manifest_row in primary.iterrows():
+        output_dir = Path(manifest_row["output_directory"])
+        aggregate = pd.read_csv(output_dir / "aggregate_model_metrics.csv")
+        ndcg = aggregate.loc[
+            aggregate["model_name"].eq("lstm")
+            & aggregate["metric"].eq("ndcg_10")
+        ].set_index("order_condition")["mean"]
+        if not {ORIGINAL, FULL_SHUFFLE, RECENT_FIXED}.issubset(ndcg.index):
+            continue
+        statistics = pd.read_csv(output_dir / "statistical_comparisons.csv")
+        full = statistics.loc[
+            statistics["model_name"].eq("lstm")
+            & statistics["intervention"].eq(FULL_SHUFFLE)
+        ].iloc[0]
+        recent = statistics.loc[
+            statistics["model_name"].eq("lstm")
+            & statistics["intervention"].eq(RECENT_FIXED)
+        ].iloc[0]
+        selected = json.loads(
+            (output_dir / "selected_hyperparameters.json").read_text(encoding="utf-8")
+        )["lstm"]
+        rows.append(
+            {
+                "model_initialization_seed": int(
+                    manifest_row["model_initialization_seed"]
+                ),
+                "original_ndcg_10": float(ndcg[ORIGINAL]),
+                "fully_shuffled_ndcg_10": float(ndcg[FULL_SHUFFLE]),
+                "original_minus_fully_shuffled": float(
+                    full["mean_paired_difference"]
+                ),
+                "ci_95_lower": float(full["ci_95_lower"]),
+                "ci_95_upper": float(full["ci_95_upper"]),
+                "wilcoxon_statistic": float(full["wilcoxon_statistic"]),
+                "wilcoxon_p_value": float(full["wilcoxon_p_value"]),
+                "recent_context_fixed_ndcg_10": float(ndcg[RECENT_FIXED]),
+                "original_minus_recent_context_fixed": float(
+                    recent["mean_paired_difference"]
+                ),
+                "selected_epochs": int(selected["epochs"]),
+                "runtime_seconds": float(manifest_row["runtime_seconds"]),
+                "run_id": manifest_row["run_id"],
+                "output_directory": manifest_row["output_directory"],
+            }
+        )
+    return pd.DataFrame(rows).sort_values("model_initialization_seed").reset_index(
+        drop=True
+    )
+
+
+def _comparison_markdown(
+    comparison: pd.DataFrame, lstm_initializations: pd.DataFrame
+) -> str:
+    """Render formal comparison tables from genuine aggregate results."""
+    sequential = comparison.loc[
+        comparison["model_name"].isin(["fpmc", "lstm", "sasrec"])
+    ].copy()
+    lines = [
+        "# Formal Sequential-Model Comparison",
+        "",
+        "All values below come from formal rating >= 4, Rule A runs. Smoke outputs are excluded.",
+        "",
+        "| Model | Original NDCG@10 | Fully Shuffled NDCG@10 | Original - Shuffled | Hierarchical 95% CI |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for _, row in sequential.iterrows():
+        lines.append(
+            f"| {str(row['model_name']).upper()} | {row['original_ndcg_10']:.6f} | "
+            f"{row['fully_shuffled_ndcg_10']:.6f} | "
+            f"{row['original_minus_fully_shuffled']:+.6f} | "
+            f"[{row['hierarchical_ci_95_lower']:+.6f}, "
+            f"{row['hierarchical_ci_95_upper']:+.6f}] |"
+        )
+    lines.extend(
+        [
+            "",
+            "## LSTM Initialization Seeds",
+            "",
+            "| Init Seed | Original NDCG@10 | Fully Shuffled NDCG@10 | Difference | 95% CI | Wilcoxon p |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for _, row in lstm_initializations.iterrows():
+        lines.append(
+            f"| {int(row['model_initialization_seed'])} | "
+            f"{row['original_ndcg_10']:.6f} | "
+            f"{row['fully_shuffled_ndcg_10']:.6f} | "
+            f"{row['original_minus_fully_shuffled']:+.6f} | "
+            f"[{row['ci_95_lower']:+.6f}, {row['ci_95_upper']:+.6f}] | "
+            f"{row['wilcoxon_p_value']:.3g} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _write_figures(
     robustness: pd.DataFrame,
     threshold: pd.DataFrame,
     timestamp: pd.DataFrame,
+    order_summary: pd.DataFrame,
+    comparison: pd.DataFrame,
     aggregate_dir: Path,
 ) -> None:
     figures = aggregate_dir / "figures"
@@ -647,6 +844,115 @@ def _write_figures(
     ax.set_title("Equal-Timestamp Rule Sensitivity")
     fig.tight_layout()
     fig.savefig(figures / "timestamp_rule_sensitivity.png", dpi=150)
+    plt.close(fig)
+
+    primary_seeds = order_summary.loc[
+        order_summary["relevance_definition"].eq("rating_ge_4")
+        & order_summary["equal_timestamp_ordering_rule"].eq(
+            "timestamp_movie_id_source"
+        )
+        & order_summary["comparison"].eq("original_minus_fully_shuffled")
+    ]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for model_name, frame in primary_seeds.groupby("model_name"):
+        frame = frame.sort_values("model_initialization_seed")
+        ax.plot(
+            frame["model_initialization_seed"],
+            frame["mean_difference"],
+            marker="o",
+            label=model_name.upper(),
+        )
+    ax.axhline(0, color="black", linestyle="--")
+    ax.set_xticks(sorted(primary_seeds["model_initialization_seed"].unique()))
+    ax.set_xlabel("Model initialization seed")
+    ax.set_ylabel("Original - fully shuffled NDCG@10")
+    ax.set_title("Order Sensitivity by Initialization Seed")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(figures / "per_initialization_order_sensitivity.png", dpi=150)
+    plt.close(fig)
+
+    sequential = comparison.loc[
+        comparison["model_name"].isin(["fpmc", "lstm", "sasrec"])
+    ].copy()
+    positions = np.arange(len(sequential))
+    width = 0.36
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(
+        positions - width / 2,
+        sequential["original_ndcg_10"],
+        width,
+        label="Original",
+    )
+    ax.bar(
+        positions + width / 2,
+        sequential["fully_shuffled_ndcg_10"],
+        width,
+        label="Fully shuffled",
+    )
+    ax.set_xticks(positions, sequential["model_name"].str.upper())
+    ax.set_ylim(bottom=0)
+    ax.set_ylabel("NDCG@10")
+    ax.set_title("Original versus Fully Shuffled Performance")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(figures / "original_vs_fully_shuffled.png", dpi=150)
+    plt.close(fig)
+
+    condition_rows: list[dict[str, object]] = []
+    for _, row in primary.iterrows():
+        condition_rows.append(
+            {
+                "model_name": row["model_name"],
+                "condition": "rating>=4 Rule A\n5-seed mean",
+                "effect": row["mean_effect_across_initializations"],
+            }
+        )
+    for _, row in threshold.loc[
+        threshold["relevance_definition"].eq("rating_ge_3")
+        & threshold["original_ndcg_10"].notna()
+    ].iterrows():
+        condition_rows.append(
+            {
+                "model_name": row["model_name"],
+                "condition": "rating>=3 Rule A\nseed 760",
+                "effect": row["original_minus_fully_shuffled"],
+            }
+        )
+    for _, row in timestamp.loc[
+        timestamp["analysis"].eq("all_eligible_users")
+        & timestamp["equal_timestamp_ordering_rule"].eq("timestamp_source")
+    ].iterrows():
+        condition_rows.append(
+            {
+                "model_name": row["model_name"],
+                "condition": "rating>=4 Rule B\nseed 760",
+                "effect": row["mean_original_minus_fully_shuffled"],
+            }
+        )
+    conditions = pd.DataFrame(condition_rows)
+    condition_order = list(conditions["condition"].drop_duplicates())
+    models = ["fpmc", "lstm", "sasrec"]
+    positions = np.arange(len(models))
+    width = 0.24
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for index, condition in enumerate(condition_order):
+        values = conditions.loc[conditions["condition"].eq(condition)].set_index(
+            "model_name"
+        )["effect"]
+        ax.bar(
+            positions + (index - 1) * width,
+            [values.get(model, np.nan) for model in models],
+            width,
+            label=condition,
+        )
+    ax.axhline(0, color="black", linestyle="--")
+    ax.set_xticks(positions, [model.upper() for model in models])
+    ax.set_ylabel("Original - fully shuffled NDCG@10")
+    ax.set_title("Order Sensitivity across Robustness Conditions")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(figures / "robustness_conditions.png", dpi=150)
     plt.close(fig)
 
 
@@ -721,17 +1027,16 @@ def _robustness_report(
             "",
         ]
     )
-    fpmc = primary.loc[primary["model_name"].eq("fpmc")].iloc[0]
-    sasrec = primary.loc[primary["model_name"].eq("sasrec")].iloc[0]
-    lines.append(
-        f"FPMC shows robust dependence on recorded rating-submission order in the completed matrix: all {int(fpmc['initialization_run_count'])} initialization effects are positive, with mean {fpmc['mean_effect_across_initializations']:+.4f} and hierarchical 95% CI {fpmc['hierarchical_ci_95_lower']:+.4f} to {fpmc['hierarchical_ci_95_upper']:+.4f}."
-    )
-    lines.append(
-        f"SASRec's effect is much smaller (mean {sasrec['mean_effect_across_initializations']:+.4f}); its initialization range includes a negative run ({sasrec['minimum_initialization_effect']:+.4f} to {sasrec['maximum_initialization_effect']:+.4f}), so evidence is positive on average but weak and initialization-sensitive."
-    )
-    lines.append(
-        "Rating-threshold and timestamp-rule analyses preserve the qualitative FPMC conclusion. SASRec remains small, although its rating>=3 effect is somewhat larger and is based on only one initialization run."
-    )
+    for _, row in primary.iterrows():
+        direction = "positive in every run" if row["positive_sign_in_all_runs"] else (
+            "negative in every run" if row["negative_sign_in_all_runs"] else "mixed across runs"
+        )
+        lines.append(
+            f"{row['model_name'].upper()} has mean recorded-order effect "
+            f"{row['mean_effect_across_initializations']:+.4f} with hierarchical 95% CI "
+            f"{row['hierarchical_ci_95_lower']:+.4f} to "
+            f"{row['hierarchical_ci_95_upper']:+.4f}; signs are {direction}."
+        )
     lines.append(
         "These are effects of the implemented rating-order interventions, not causal effects of true watching order or evidence that sequential recommendation generally succeeds or fails."
     )
@@ -754,6 +1059,8 @@ def aggregate_matrix(manifest: pd.DataFrame, aggregate_dir: Path) -> dict[str, p
     timestamp = _timestamp_tie_sensitivity(complete, per_user)
     nonseq = _non_sequential_audit(complete)
     seed_results = _seed_level_results(complete)
+    comparison = _model_comparison(complete, robustness)
+    lstm_initializations = _lstm_per_initialization(complete)
     outputs = {
         "run_manifest.csv": manifest,
         "seed_level_results.csv": seed_results,
@@ -762,10 +1069,22 @@ def aggregate_matrix(manifest: pd.DataFrame, aggregate_dir: Path) -> dict[str, p
         "order_condition_comparisons.csv": order_summary,
         "non_sequential_invariance_audit.csv": nonseq,
         "robustness_summary.csv": robustness,
+        "model_comparison.csv": comparison,
+        "lstm_per_initialization_results.csv": lstm_initializations,
     }
     for filename, frame in outputs.items():
         frame.to_csv(aggregate_dir / filename, index=False)
-    _write_figures(robustness, threshold, timestamp, aggregate_dir)
+    _write_figures(
+        robustness,
+        threshold,
+        timestamp,
+        order_summary,
+        comparison,
+        aggregate_dir,
+    )
+    (aggregate_dir / "model_comparison.md").write_text(
+        _comparison_markdown(comparison, lstm_initializations), encoding="utf-8"
+    )
     (aggregate_dir / "robustness_report.md").write_text(
         _robustness_report(manifest, robustness, threshold, timestamp, incomplete),
         encoding="utf-8",
@@ -777,6 +1096,18 @@ def _parse_int_tuple(value: str) -> tuple[int, ...]:
     values = tuple(int(item.strip()) for item in value.split(",") if item.strip())
     if not values:
         raise argparse.ArgumentTypeError("At least one seed is required")
+    return values
+
+
+def _parse_model_tuple(value: str) -> tuple[str, ...]:
+    values = tuple(item.strip().lower() for item in value.split(",") if item.strip())
+    unknown = set(values) - set(ALL_MODELS)
+    if not values:
+        raise argparse.ArgumentTypeError("At least one model is required")
+    if unknown:
+        raise argparse.ArgumentTypeError(f"Unknown models: {sorted(unknown)}")
+    if len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError("Model names must be unique")
     return values
 
 
@@ -795,6 +1126,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-rule-b", action="store_true")
     parser.add_argument("--max-new-runs", type=int)
     parser.add_argument("--aggregate-only", action="store_true")
+    parser.add_argument(
+        "--include-manifest",
+        type=Path,
+        action="append",
+        default=[],
+        help="Additional compatible run manifest to include in unified aggregation",
+    )
+    parser.add_argument(
+        "--models",
+        type=_parse_model_tuple,
+        default=("fpmc", "sasrec"),
+        help="Comma-separated models for new matrix cells",
+    )
     return parser.parse_args()
 
 
@@ -807,11 +1151,16 @@ def main() -> None:
         arguments.initialization_seeds,
         include_rating3=not arguments.skip_rating3,
         include_rule_b=not arguments.skip_rule_b,
+        model_names=arguments.models,
     )
     if arguments.aggregate_only:
         manifest = pd.read_csv(arguments.aggregate_dir / "run_manifest.csv")
     else:
         manifest = run_matrix(specs, arguments.aggregate_dir, arguments.max_new_runs)
+    included = [pd.read_csv(path) for path in arguments.include_manifest]
+    if included:
+        manifest = pd.concat([manifest, *included], ignore_index=True)
+    manifest = manifest.drop_duplicates("run_id", keep="first").reset_index(drop=True)
     aggregate_matrix(manifest, arguments.aggregate_dir)
 
 
