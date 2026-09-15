@@ -8,7 +8,7 @@ MovieLens timestamps record **rating submission**, not confirmed movie viewing. 
 
 ## Primary workflow
 
-`ml1m_order_experiment.py` is the primary controlled experiment. It uses a deterministic chronological train/validation/test split, multi-target full-catalog ranking, matched FPMC and SASRec controls, independent random-seed roles, and paired user-level inference.
+`ml1m_order_experiment.py` is the primary controlled experiment. It uses a deterministic chronological train/validation/test split, multi-target full-catalog ranking, matched FPMC, LSTM, and SASRec controls, independent random-seed roles, and paired user-level inference.
 
 The experiment compares:
 
@@ -16,7 +16,7 @@ The experiment compares:
 2. **Fully shuffled pre-test:** independently shuffles every user's complete train-plus-validation history while preserving users, item multisets, lengths, item frequencies, validation targets, and test targets. This is the primary intervention.
 3. **Recent-context-fixed shuffle:** shuffles the earlier training history but preserves the validation/recent-context suffix. This is a secondary ablation.
 
-Popularity, ItemKNN, and TruncatedSVD matrix factorization are order-invariant controls. FPMC and SASRec are evaluated under every order condition with common users, mappings, targets, candidates, metrics, and tuning decisions.
+Popularity, ItemKNN, and TruncatedSVD matrix factorization are order-invariant controls. FPMC, LSTM, and SASRec are evaluated under every order condition with common users, mappings, targets, candidates, metrics, and tuning decisions. `--models` can select a subset without changing the shared experiment semantics.
 
 `ml1m_revised_sequence_feasibility.py` and `ml1m_model_feasibility.py` remain available as legacy feasibility workflows. Their historical outputs should not be mixed directly with the controlled experiment.
 
@@ -26,7 +26,28 @@ Popularity, ItemKNN, and TruncatedSVD matrix factorization are order-invariant c
 - `src/movie_recommender/`: loaders, legacy analyses, and controlled experiment code
 - `tests/`: unit, invariant, causal-attention, synthetic end-to-end, and reproducibility tests
 - `outputs/`: generated experiment artifacts; ignored by Git
+- `results/final_20260916/`: compact, tracked final tables, figures, provenance, and report evidence
 - `notebooks/`: optional exploratory work, not the source of formal results
+
+## Experiment design
+
+The frozen formal study uses MovieLens 1M, chronological per-user holdouts, and NDCG@10 as the primary metric. Ratings >= 4 define the primary positive interactions; ratings >= 3 provide a robustness condition. Rule A orders equal-timestamp events by `timestamp, movieId, source order`, while Rule B uses `timestamp, source order`.
+
+The non-sequential controls are Popularity, ItemKNN, and TruncatedSVD matrix factorization. The sequential models are FPMC, LSTM, and SASRec. Original, fully shuffled, and recent-context-fixed histories share users, items, targets, candidates, evaluation, and tuning decisions so that the principal intervention is pre-test order.
+
+## Final results
+
+The completed primary rating >= 4 Rule A condition uses five initialization seeds (760-764) and three shuffle seeds (20760-20762):
+
+| Model | Original NDCG@10 | Shuffled NDCG@10 | Difference | Hierarchical 95% CI |
+| --- | ---: | ---: | ---: | ---: |
+| FPMC | 0.074599 | 0.053814 | +0.020784 | +0.019412 to +0.022146 |
+| LSTM | 0.059979 | 0.054923 | +0.005057 | +0.002268 to +0.008866 |
+| SASRec | 0.055209 | 0.053555 | +0.001654 | +0.000506 to +0.002669 |
+
+FPMC shows the largest and most stable order sensitivity in this setup. LSTM is positive in all five runs but materially initialization-sensitive (SD 0.004164; range +0.001574 to +0.011911), with seed 761 noticeably larger. SASRec shows a smaller effect. All static baselines remain exactly invariant.
+
+These are architecture-specific responses to the same intervention, not a universal ranking of recommender architectures. MovieLens timestamps record rating submission rather than confirmed movie consumption. The authoritative compact evidence package is `results/final_20260916/`.
 
 ## MovieLens 1M setup
 
@@ -70,7 +91,7 @@ $env:PYTHONPATH = "src"
 
 ## Formal experiment
 
-The default formal run uses three deterministic sequence-shuffle seeds. Additional initialization seeds can be supplied as a comma-separated list when compute permits.
+The default formal runner uses three deterministic sequence-shuffle seeds. The experiment is now frozen; these commands document reproduction rather than invite retuning.
 
 ```powershell
 $env:PYTHONPATH = "src"
@@ -78,13 +99,25 @@ $env:PYTHONPATH = "src"
   --output-dir outputs/ml1m_order_experiment_rating4
 ```
 
-Example initialization-seed sensitivity:
+Example initialization-seed specification:
 
 ```powershell
 --model-initialization-seeds 760,761,762
 ```
 
 Relevance sensitivity uses `--relevance-threshold 3`; `--all-ratings` treats every rating event as an interaction. The main interpretation remains positive rating-event order for the default threshold of 4.
+
+## Integrated LSTM validation
+
+The compatibility command and direct model selection both use the same authoritative runner and output schema. Smoke metrics are non-scientific.
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe -m movie_recommender.ml1m_order_experiment `
+  --models lstm `
+  --fast-test `
+  --output-dir outputs/ml1m_lstm_integrated_smoke
+```
 
 ## Robustness matrix
 
@@ -112,12 +145,29 @@ To resume incomplete cells, rerun the same command. To rebuild only the cross-ru
 
 The aggregate uses a two-level bootstrap that samples initialization runs and then users within selected runs. Secondary threshold, timestamp, and recent-context comparisons are labelled exploratory or robustness analyses rather than confirmatory tests.
 
+The completed FPMC/SASRec directories remain immutable. The completed LSTM matrix used the same five initialization seeds and three shuffle seeds while writing only to new directories:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe -m movie_recommender.ml1m_robustness `
+  --models lstm `
+  --runs-dir outputs/ml1m_lstm_robustness_runs_20260916 `
+  --aggregate-dir outputs/ml1m_lstm_robustness_20260916 `
+  --primary-result-dir outputs/ml1m_lstm_order_experiment_rating4_init760_20260916 `
+  --initialization-seeds 760,761,762,763,764 `
+  --include-manifest outputs/ml1m_order_robustness_20260817/run_manifest.csv
+```
+
+Including the preserved manifest produces unified `model_comparison.csv` and robustness tables without rerunning or rewriting the completed FPMC/SASRec directories.
+
+To regenerate only the unified aggregate after all cells are complete, append `--aggregate-only` to the same command. Do not rerun formal cells unless a genuine reproducibility defect is discovered.
+
 ## Outputs
 
 Each result directory is self-contained and includes configuration, environment and hardware metadata, dataset checksum, split audit, eligible/excluded users, candidate audits, validation results, selected hyperparameters, per-user and aggregate metrics, seed-level results, paired differences, statistical comparisons, training curves, sensitivity summaries, figures, and an actual-results Markdown report.
 
-The cross-run robustness directory contains only manifests and aggregate evidence tables; raw per-run artifacts remain in their separate result directories.
+The cross-run robustness directory contains only manifests and aggregate evidence tables, including `model_comparison.csv`; raw per-run artifacts remain in their separate result directories. Full raw outputs are intentionally ignored by Git. The small `results/final_20260916/` package is version-controlled so teammates can inspect the final findings without copying large per-user files.
 
 On the current 16-thread CPU-only machine, smoke tests take roughly a minute. Formal runtime depends strongly on initialization seeds and epochs; allow tens of minutes and consult `environment_and_hardware.json` for the measured runtime.
 
-Smoke outputs and subgroup analyses are exploratory. Only a completed formal result directory should be used for confirmatory claims, and final paper claims still require checking robustness across relevance thresholds, history requirements, and model initialization seeds.
+Smoke outputs and subgroup analyses are exploratory and are excluded from the final package. The formal robustness matrix is complete: all seven LSTM cells passed, the preserved FPMC/SASRec results were incorporated without modification, and no additional modelling or post-hoc tuning is planned.

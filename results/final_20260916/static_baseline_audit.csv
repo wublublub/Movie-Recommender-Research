@@ -1,0 +1,4 @@
+model_name,audited_run_count,maximum_absolute_difference,all_invariant
+item_knn,7,0.0,True
+matrix_factorization,7,0.0,True
+popularity,7,0.0,True

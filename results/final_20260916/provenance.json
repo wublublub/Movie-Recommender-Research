@@ -1,0 +1,16 @@
+{
+  "package_date": "2026-09-16",
+  "authoritative_aggregate_directory": "outputs/ml1m_lstm_robustness_20260916",
+  "preserved_fpmc_sasrec_manifest": "outputs/ml1m_order_robustness_20260817/run_manifest.csv",
+  "formal_lstm_manifest": "outputs/ml1m_lstm_robustness_20260916/run_manifest.csv",
+  "smoke_outputs_included": false,
+  "source_checksums": {
+    "model_comparison.csv": "9480f5aecd2f67d2c77f63cf56bdace2c86fcf2113a552a0fc4583a43d0ccaa7",
+    "lstm_per_initialization_results.csv": "8a0a7a473ea2fe3a7537c4b3a4c334b22ab0c536e08e1615f16da2c0b2e9c3da",
+    "robustness_summary.csv": "b4b19be86a86a0718cd59ec2ef732d91ebbb0a9fd3aa7ec3a8f013b876048860",
+    "threshold_sensitivity.csv": "bf5fefc16728fbcde86f972679b21c5c7a6d6cc5918daae64166173b1b253a45",
+    "timestamp_tie_sensitivity.csv": "bb1253010a67682e65c635d9dba890c751e8394a0398f251f96b6d30b1d3052b",
+    "non_sequential_invariance_audit.csv": "594b5e51bf96ec897933e25242bb7e08b49bc8dd684e995f97fd92e4f63dab8f",
+    "run_manifest.csv": "c36806978c7c62a6779e94f59fd7bf2788e34e1b863cd3d8691bbdf0d3fc86ce"
+  }
+}

@@ -17,5 +17,7 @@ models/
 *.joblib
 
 # Generated experiment outputs
-results/
+results/*
+!results/final_20260916/
+!results/final_20260916/**
 outputs/
