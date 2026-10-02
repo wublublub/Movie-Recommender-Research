@@ -129,6 +129,7 @@ class RevisedConfig:
     clear_win_epsilon: float = 0.01
     fast_test: bool = False
     fast_user_limit: int = 300
+    user_limit: int | None = None
     equal_timestamp_ordering_rule: str = "timestamp_movie_id_source"
 
     def serializable(self) -> dict[str, object]:
@@ -163,11 +164,12 @@ class RevisedSplit:
 
 @dataclass
 class RankingSet:
-    """Set-based full-ranking candidates and relevant targets."""
+    """Full-ranking candidates and set- or event-based relevant targets."""
 
     user_id: int
     candidate_movie_ids: np.ndarray
     relevant_movie_ids: set[int]
+    relevant_movie_events: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -314,10 +316,13 @@ def revised_chronological_split(
     ]
     eligible = pd.DataFrame(eligible_records, columns=eligible_columns)
     selected_user_ids = eligible["user_id"].to_numpy(dtype=np.int64)
-    if config.fast_test and len(selected_user_ids) > config.fast_user_limit:
+    user_limit = config.user_limit
+    if user_limit is None and config.fast_test:
+        user_limit = config.fast_user_limit
+    if user_limit is not None and len(selected_user_ids) > user_limit:
         rng = np.random.default_rng(config.random_seed)
         selected_user_ids = np.sort(
-            rng.choice(selected_user_ids, config.fast_user_limit, replace=False)
+            rng.choice(selected_user_ids, user_limit, replace=False)
         )
         eligible = eligible.loc[eligible["user_id"].isin(selected_user_ids)].copy()
 
@@ -442,8 +447,11 @@ def build_ranking_sets(
     split: RevisedSplit,
     targets: pd.DataFrame,
     all_movie_ids: np.ndarray,
+    candidate_policy: str = "unseen",
 ) -> tuple[dict[int, RankingSet], pd.DataFrame]:
-    """Build full-ranking unseen-item candidate sets for target blocks."""
+    """Build fixed full-ranking candidate sets for target blocks."""
+    if candidate_policy not in {"unseen", "all_items"}:
+        raise ValueError("candidate_policy must be 'unseen' or 'all_items'")
     full_by_user = {
         int(user_id): frame
         for user_id, frame in split.full_ratings.groupby("UserID", sort=False)
@@ -457,27 +465,38 @@ def build_ranking_sets(
         observed = history.loc[
             history["_user_order_rank"].lt(first["_user_order_rank"]), "MovieID"
         ]
-        relevant = set(int(item) for item in ordered_targets["MovieID"])
+        relevant_events = ordered_targets["MovieID"].to_numpy(dtype=np.int64)
+        relevant = set(int(item) for item in relevant_events)
         observed_items = set(int(value) for value in observed)
-        candidates = np.asarray(
-            [
-                item
-                for item in all_movie_ids
-                if int(item) not in observed_items
-                or int(item) in relevant
-            ],
-            dtype=np.int64,
-        )
+        if candidate_policy == "all_items":
+            candidates = np.asarray(all_movie_ids, dtype=np.int64).copy()
+        else:
+            candidates = np.asarray(
+                [
+                    item
+                    for item in all_movie_ids
+                    if int(item) not in observed_items
+                    or int(item) in relevant
+                ],
+                dtype=np.int64,
+            )
         if not relevant.issubset(set(int(item) for item in candidates)):
             raise RuntimeError(f"Target omission in candidate set for user {user_id}")
-        sets[int(user_id)] = RankingSet(int(user_id), candidates, relevant)
+        sets[int(user_id)] = RankingSet(
+            int(user_id), candidates, relevant, relevant_events
+        )
         rows.append(
             {
                 "user_id": int(user_id),
                 "relevant_movie_ids": "|".join(str(item) for item in sorted(relevant)),
+                "relevant_movie_events": "|".join(
+                    str(item) for item in relevant_events
+                ),
                 "candidate_movie_ids": "|".join(str(item) for item in candidates),
-                "number_of_test_targets": len(relevant),
+                "number_of_test_targets": len(relevant_events),
+                "number_of_unique_targets": len(relevant),
                 "number_of_candidates": len(candidates),
+                "candidate_policy": candidate_policy,
             }
         )
     return sets, pd.DataFrame(rows)
@@ -529,14 +548,50 @@ def set_ranking_metrics(
     )
 
 
+def event_ranking_metrics(
+    scores: np.ndarray,
+    candidate_movie_ids: np.ndarray,
+    relevant_movie_events: np.ndarray,
+    k: int = 10,
+) -> tuple[dict[str, float], np.ndarray]:
+    """Average single-target metrics across held-out interaction events."""
+    if len(relevant_movie_events) == 0:
+        raise ValueError("Event-based evaluation requires at least one target event")
+    order = np.lexsort((candidate_movie_ids, -scores))
+    ranked_items = candidate_movie_ids[order]
+    top_items = ranked_items[:k]
+    ranks = {int(item): rank for rank, item in enumerate(ranked_items, start=1)}
+    event_ranks = np.asarray(
+        [ranks[int(item)] for item in relevant_movie_events], dtype=np.int64
+    )
+    hits = event_ranks <= k
+    discounted = np.where(hits, 1.0 / np.log2(event_ranks + 1), 0.0)
+    reciprocal = np.where(hits, 1.0 / event_ranks, 0.0)
+    hit_fraction = float(hits.mean())
+    return (
+        {
+            "precision_10": hit_fraction / k,
+            "recall_10": hit_fraction,
+            "ndcg_10": float(discounted.mean()),
+            "hit_rate_10": hit_fraction,
+            "mrr_10": float(reciprocal.mean()),
+            "map_10": float(reciprocal.mean()),
+        },
+        top_items,
+    )
+
+
 def evaluate_full_ranker(
     model_name: str,
     ranking_sets: dict[int, RankingSet],
     user_ids: np.ndarray,
     item_to_index: dict[int, int],
     scorer: object,
+    target_semantics: str = "set",
 ) -> pd.DataFrame:
-    """Evaluate a callable scorer over each user's full unseen candidate set."""
+    """Evaluate a callable scorer over each user's fixed full-ranking candidates."""
+    if target_semantics not in {"set", "events"}:
+        raise ValueError("target_semantics must be 'set' or 'events'")
     rows: list[dict[str, object]] = []
     for user_index, user_id in enumerate(user_ids):
         ranking_set = ranking_sets[int(user_id)]
@@ -545,15 +600,31 @@ def evaluate_full_ranker(
             dtype=np.int32,
         )
         scores = np.asarray(scorer(user_index, candidate_indices), dtype=float)
-        metrics, top_items = set_ranking_metrics(
-            scores, ranking_set.candidate_movie_ids, ranking_set.relevant_movie_ids
+        if target_semantics == "events":
+            if ranking_set.relevant_movie_events is None:
+                raise ValueError("Event targets are missing from the ranking set")
+            metrics, top_items = event_ranking_metrics(
+                scores,
+                ranking_set.candidate_movie_ids,
+                ranking_set.relevant_movie_events,
+            )
+        else:
+            metrics, top_items = set_ranking_metrics(
+                scores, ranking_set.candidate_movie_ids, ranking_set.relevant_movie_ids
+            )
+        target_count = (
+            len(ranking_set.relevant_movie_events)
+            if target_semantics == "events"
+            and ranking_set.relevant_movie_events is not None
+            else len(ranking_set.relevant_movie_ids)
         )
         rows.append(
             {
                 "user_id": int(user_id),
                 "model_name": model_name,
                 **metrics,
-                "number_of_test_targets": len(ranking_set.relevant_movie_ids),
+                "number_of_test_targets": target_count,
+                "number_of_unique_targets": len(ranking_set.relevant_movie_ids),
                 "number_of_candidates": len(ranking_set.candidate_movie_ids),
                 "top_10_movie_ids": "|".join(str(item) for item in top_items),
             }

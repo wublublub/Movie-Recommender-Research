@@ -171,3 +171,27 @@ The cross-run robustness directory contains only manifests and aggregate evidenc
 On the current 16-thread CPU-only machine, smoke tests take roughly a minute. Formal runtime depends strongly on initialization seeds and epochs; allow tens of minutes and consult `environment_and_hardware.json` for the measured runtime.
 
 Smoke outputs and subgroup analyses are exploratory and are excluded from the final package. The formal robustness matrix is complete: all seven LSTM cells passed, the preserved FPMC/SASRec results were incorporated without modification, and no additional modelling or post-hoc tuning is planned.
+
+## Foursquare NYC adapter
+
+The TSMC2014 NYC integration reads the original Latin-1, tab-separated file from `data/raw/dataset_tsmc2014/dataset_TSMC2014_NYC.txt`. It preserves repeated user-venue events, sorts by UTC timestamp with source-row order as the deterministic tie-break, and temporarily maps canonical `user_id`, `item_id`, and `timestamp` fields to the shared runner's legacy column names.
+
+Foursquare uses full-catalog candidates including previously visited venues. Held-out targets retain event multiplicity: metrics average single-target Top-K outcomes across every held-out check-in event, so repeated visits are not collapsed. This differs intentionally from MovieLens's unseen-item, set-target policy.
+
+Run only the bounded pilot until a formal run is explicitly approved:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe -m movie_recommender.foursquare_order_experiment `
+  --data-dir data/raw/dataset_tsmc2014 `
+  --output-dir outputs/foursquare_nyc_pilot `
+  --fast-test `
+  --fast-user-limit 12 `
+  --maximum-epochs 1 `
+  --batch-size 8 `
+  --lstm-batch-size 2
+```
+
+The non-fast command is documented by `--help` but should not be launched without explicit approval. Parameter candidates are selected on original-order validation only and then frozen for original and shuffled test conditions.
+
+Use `--user-limit N` for a deterministic medium-scale subset without enabling the architecture and epoch shortcuts associated with `--fast-test`.
