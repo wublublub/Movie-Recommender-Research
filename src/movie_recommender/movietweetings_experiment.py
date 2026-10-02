@@ -113,6 +113,33 @@ def evaluate(sets: CompactSets, scorer, batch_size=64) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def fpmc_rank_diagnostics(sets: CompactSets, scorer, training_movie_ids: set[int]) -> pd.DataFrame:
+    rows = []
+    for user_index, user_id in enumerate(sets.user_ids):
+        scores = np.asarray(scorer(user_index, user_index + 1))[0]
+        candidate_mask = np.ones(len(sets.movie_ids), dtype=bool)
+        candidate_mask[sets.excluded[user_index]] = False
+        candidate_scores = scores[candidate_mask]
+        finite = bool(np.isfinite(candidate_scores).all())
+        if not finite:
+            raise ValueError("Nonfinite FPMC candidate scores")
+        for target_index in sets.targets[user_index]:
+            target_score = scores[target_index]
+            rank = 1 + int(np.count_nonzero(candidate_scores > target_score))
+            rank += int(np.count_nonzero((scores == target_score) & candidate_mask &
+                                         (np.arange(len(scores)) < target_index)))
+            rows.append({
+                "user_id": int(user_id), "target_movie_id": int(sets.movie_ids[target_index]),
+                "warm_in_global_training": int(sets.movie_ids[target_index]) in training_movie_ids,
+                "rank": rank, "candidate_count": len(candidate_scores),
+                "all_candidate_scores_finite": finite,
+                "candidate_score_min": float(candidate_scores.min()),
+                "candidate_score_max": float(candidate_scores.max()),
+                "candidate_score_std": float(candidate_scores.std()),
+            })
+    return pd.DataFrame(rows)
+
+
 def block_item_knn(matrix, neighbors=50, block_size=128):
     item_user = matrix.T.tocsr()
     model = NearestNeighbors(
@@ -162,8 +189,9 @@ def neural_scorer(model, sequences, kind, max_length):
     return score
 
 
-def train_neural(kind, sequences, item_count, parameters, epochs, label, validation=None):
-    set_deterministic_seed(760)
+def train_neural(kind, sequences, item_count, parameters, epochs, label, validation=None,
+                 initialization_seed=760):
+    set_deterministic_seed(initialization_seed)
     if kind == "sasrec":
         params = SASRecParameters(**parameters)
         model = SASRec(item_count, params)
@@ -177,8 +205,8 @@ def train_neural(kind, sequences, item_count, parameters, epochs, label, validat
     for epoch in range(1, epochs + 1):
         started = time.perf_counter()
         model.train()
-        arrays = training_arrays(sequences, max_length, item_count, 17760 + epoch) if kind == "sasrec" else None
-        order = np.random.default_rng(760 + epoch).permutation(len(sequences))
+        arrays = training_arrays(sequences, max_length, item_count, 17000 + initialization_seed + epoch) if kind == "sasrec" else None
+        order = np.random.default_rng(initialization_seed + epoch).permutation(len(sequences))
         losses = []
         for start in range(0, len(order), batch_size):
             indices = order[start:start + batch_size]
@@ -251,22 +279,73 @@ def write_json(path, payload):
     path.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def summarize(per_user, output, smoke):
+def current_git_branch() -> str:
+    return subprocess.check_output(
+        ["git", "-c", f"safe.directory={ROOT.as_posix()}", "branch", "--show-current"],
+        cwd=ROOT, text=True,
+    ).strip()
+
+
+def parse_initialization_seeds(value: str | None) -> list[int]:
+    if value is None:
+        return [760]
+    try:
+        seeds = [int(part.strip()) for part in value.split(",")]
+    except ValueError as error:
+        raise ValueError("--initialization-seeds requires comma-separated integers") from error
+    if not seeds or any(seed < 0 for seed in seeds) or len(set(seeds)) != len(seeds):
+        raise ValueError("--initialization-seeds requires distinct nonnegative integers")
+    return seeds
+
+
+def condition_grid(initialization_seeds, shuffle_seeds, pilot):
+    return [(initialization_seed, ORIGINAL, None) for initialization_seed in initialization_seeds] + [
+        (initialization_seed, condition, shuffle_seed)
+        for initialization_seed in initialization_seeds
+        for shuffle_seed in shuffle_seeds
+        for condition in ((FULL_SHUFFLE,) if pilot else (FULL_SHUFFLE, RECENT_FIXED))
+    ]
+
+
+def seed_metadata(initialization_seeds, shuffle_seeds):
+    return {"initialization_seeds": list(initialization_seeds),
+            "shuffle_seeds": list(shuffle_seeds)}
+
+
+def summarize(per_user, output, smoke, interventions=(FULL_SHUFFLE, RECENT_FIXED)):
     aggregate = per_user.groupby(["model_name", "order_condition"])[list(METRICS)].mean().reset_index()
     aggregate.to_csv(output / "aggregate_metrics.csv", index=False)
+    per_initialization = per_user.groupby(
+        ["model_initialization_seed", "model_name", "order_condition"]
+    )[list(METRICS)].mean().reset_index()
+    per_initialization.to_csv(output / "aggregate_metrics_by_initialization.csv", index=False)
     effects, seed_effects = [], []
     for model_name in ("fpmc", "sasrec", "lstm"):
         frame = per_user.loc[per_user.model_name.eq(model_name)]
-        original = frame.loc[frame.order_condition.eq(ORIGINAL)].set_index("user_id")["ndcg_10"]
-        for condition in (FULL_SHUFFLE, RECENT_FIXED):
+        original = frame.loc[frame.order_condition.eq(ORIGINAL)].set_index(
+            ["model_initialization_seed", "user_id"]
+        )["ndcg_10"]
+        for condition in interventions:
             other = frame.loc[frame.order_condition.eq(condition)]
-            by_user = other.groupby("user_id")["ndcg_10"].mean().reindex(original.index)
+            by_user = other.groupby(["model_initialization_seed", "user_id"])["ndcg_10"].mean().reindex(original.index)
             values = (original - by_user).to_numpy()
             if not np.isfinite(values).all():
                 raise AssertionError("Incomplete paired results")
             rng = np.random.default_rng(30760 + len(effects))
-            means = np.array([rng.choice(values, len(values), replace=True).mean() for _ in range(200 if smoke else 5000)])
-            nonzero = values[values != 0]
+            initialization_count = original.index.get_level_values(0).nunique()
+            samples = 200 if smoke else 5000
+            if initialization_count == 1:
+                means = np.array([rng.choice(values, len(values), replace=True).mean()
+                                  for _ in range(samples)])
+            else:
+                paired = (original - by_user).unstack("user_id").to_numpy()
+                means = np.array([
+                    paired[np.ix_(rng.integers(initialization_count, size=initialization_count),
+                                  rng.integers(paired.shape[1], size=paired.shape[1]))].mean()
+                    for _ in range(samples)
+                ])
+            user_effects = (original - by_user).groupby("user_id").mean().to_numpy()
+            nonzero = user_effects[user_effects != 0]
             p = float(wilcoxon(nonzero).pvalue) if len(nonzero) else 1.0
             low, high = np.quantile(means, [.025, .975])
             adjusted_low, adjusted_high = np.quantile(means, [.05 / 6, 1 - .05 / 6])
@@ -279,12 +358,21 @@ def summarize(per_user, output, smoke):
                 "ci_bonferroni_three_models_low": float(adjusted_low),
                 "ci_bonferroni_three_models_high": float(adjusted_high),
                 "standardized_effect": float(values.mean() / values.std(ddof=1)) if values.std(ddof=1) else 0.0,
-                "wilcoxon_p": p, "users": len(values),
-                "uncertainty": "user bootstrap conditional on one initialization and configured shuffles",
+                "wilcoxon_p": p, "users": len(user_effects),
+                "initialization_count": initialization_count,
+                "uncertainty": (
+                    "hierarchical paired initialization/user bootstrap, configured shuffles"
+                    if initialization_count > 1 else
+                    "user bootstrap conditional on one initialization and configured shuffles"
+                ),
             })
-            for seed, group in other.groupby("sequence_shuffle_seed"):
-                delta = original - group.set_index("user_id")["ndcg_10"].reindex(original.index)
+            for (initialization_seed, seed), group in other.groupby(
+                ["model_initialization_seed", "sequence_shuffle_seed"]
+            ):
+                matching_original = original.loc[initialization_seed]
+                delta = matching_original - group.set_index("user_id")["ndcg_10"].reindex(matching_original.index)
                 seed_effects.append({"model_name": model_name, "intervention": condition,
+                                     "initialization_seed": int(initialization_seed),
                                      "shuffle_seed": int(seed), "mean_paired_difference": float(delta.mean())})
     statistics = pd.DataFrame(effects)
     statistics.to_csv(output / "order_effects.csv", index=False)
@@ -292,12 +380,20 @@ def summarize(per_user, output, smoke):
     return aggregate, statistics
 
 
-def run(smoke=False, name=None):
+def run(smoke=False, name=None, pilot_users=None, initialization_seeds=None):
     started = time.perf_counter()
-    name = name or ("smoke" if smoke else "formal_rating8")
+    if pilot_users is not None and (smoke or not 1 <= pilot_users <= 1500):
+        raise ValueError("Pilot requires 1-1500 users and cannot use --smoke")
+    initialization_seeds = [760] if initialization_seeds is None else list(initialization_seeds)
+    if not initialization_seeds or any(seed < 0 for seed in initialization_seeds) or len(set(initialization_seeds)) != len(initialization_seeds):
+        raise ValueError("Initialization seeds must be distinct nonnegative integers")
+    pilot = pilot_users is not None
+    name = name or (f"medium_pilot_u{pilot_users}" if pilot else "smoke" if smoke else "formal_rating8")
     if not name or Path(name).name != name or name in (".", ".."):
         raise ValueError("Run name must be a single directory name")
     output = ROOT / "outputs" / "movietweetings_experiment" / name
+    if pilot and output.exists():
+        raise FileExistsError(f"Refusing to overwrite pilot output: {output}")
     output.mkdir(parents=True, exist_ok=True)
     protected = protected_snapshot()
     protection_path = output / "protected_movielens_before.json"
@@ -311,12 +407,14 @@ def run(smoke=False, name=None):
         raise ValueError("Wrong dataset version")
     protocol = {
         "dataset": "MovieTweetings", "upstream_commit": COMMIT,
-        "source_files": provenance, "smoke_test": smoke, "threshold": 8,
-        "initialization_seeds": [760], "shuffle_seeds": [20760] if smoke else [20760, 20761, 20762],
+        "source_files": provenance, "smoke_test": smoke, "pilot": pilot,
+        "pilot_user_limit": pilot_users, "threshold": 8,
+        **seed_metadata(initialization_seeds, [20760] if smoke or pilot else [20760, 20761, 20762]),
         "maximum_neural_epochs": 2 if smoke else 5, "patience": 2,
         "negative_sampling_seed": 17760, "bootstrap_seed": 30760,
         "split": "per-user chronological positive events; 10% validation and test, min 5/2/2",
         "metadata_policy": "unique numeric MovieID; titles and genres are unused, raw aliases retained",
+        "primary_threshold_rationale": "rating >=8 is the prespecified high-positive category on the 0-10 scale; 7 and 9 are audit-only sensitivity thresholds",
         "catalog_policy": "all normalized catalog items, including cold items; no sampled candidates",
         "scope": "source movie-rating catalog including shorts; not independently feature-film-only verified",
         "ranking": "same observed-item exclusion and target inclusion as MovieLens, computed in batches",
@@ -334,7 +432,8 @@ def run(smoke=False, name=None):
     print(f"Loaded data in {time.perf_counter() - started:.1f}s", flush=True)
     if ratings.duplicated(["UserID", "MovieID"]).any():
         raise ValueError("Repeated user-movie ratings need an explicit policy")
-    config = RevisedConfig(relevance_threshold=8, fast_test=smoke, fast_user_limit=40, random_seed=40760)
+    config = RevisedConfig(relevance_threshold=8, fast_test=smoke, fast_user_limit=40,
+                           user_limit=pilot_users, random_seed=40760)
     split = revised_chronological_split(ratings, config)
     print(f"Split complete at {time.perf_counter() - started:.1f}s", flush=True)
     movie_ids = np.sort(movies["MovieID"].unique())
@@ -345,6 +444,26 @@ def run(smoke=False, name=None):
     histories = build_order_histories(split, users, mapping, protocol["shuffle_seeds"])
     print(f"Order histories complete at {time.perf_counter() - started:.1f}s", flush=True)
     validation, test = compact_sets(split, split.validation_positive, movie_ids), compact_sets(split, split.test_positive, movie_ids)
+    shuffled = histories.fully_shuffled[protocol["shuffle_seeds"][0]]
+    multiset_mismatches = sum(
+        not np.array_equal(np.sort(original), np.sort(shuffled_row))
+        for original, shuffled_row in zip(histories.original, shuffled, strict=True)
+    )
+    candidate_target_mismatches = sum(
+        bool(np.intersect1d(excluded, targets).size)
+        for excluded, targets in zip(test.excluded, test.targets, strict=True)
+    )
+    if multiset_mismatches or candidate_target_mismatches:
+        raise AssertionError("Pilot order or candidate/target invariant failed")
+    write_json(output / "order_audit.json", {
+        "original_users": len(histories.original),
+        "fully_shuffled_users": len(shuffled),
+        "interaction_multiset_mismatches": multiset_mismatches,
+        "candidate_target_mismatches": candidate_target_mismatches,
+        "condition_specific_target_or_candidate_sets": False,
+        "validation_users": len(validation.user_ids),
+        "test_users": len(test.user_ids),
+    })
     split.summary.to_csv(output / "split_summary.csv", index=False)
     split.split_table[["UserID", "MovieID", "Rating", "Timestamp", "_source_order", "split"]].to_csv(output / "split_assignments.csv", index=False)
     pd.DataFrame({"MovieID": movie_ids, "item_index": range(len(movie_ids))}).to_csv(output / "item_mapping.csv", index=False)
@@ -354,17 +473,19 @@ def run(smoke=False, name=None):
         "test_targets": int(sum(map(len, test.targets))), "invariants_passed": True})
     print(f"Dataset ready: {len(users)} users, {len(movie_ids)} items; smoke={smoke}", flush=True)
     all_frames = []
-    def store(frame, model_name, condition, seed, path):
+    model_runtime = {}
+    training_movie_ids = set(split.train_positive["MovieID"].astype(int)) if pilot else set()
+    def store(frame, model_name, condition, seed, path, initialization_seed=760):
         frame = frame.assign(model_name=model_name, order_condition=condition,
-                             model_initialization_seed=760, sequence_shuffle_seed=seed)
+                             model_initialization_seed=initialization_seed, sequence_shuffle_seed=seed)
         frame.to_csv(path, index=False)
         print(f"Completed {model_name} {condition} {seed}: NDCG@10={frame.ndcg_10.mean():.6f}", flush=True)
         return frame
 
     baseline_path = output / "baselines.csv"
-    if baseline_path.exists():
+    if not pilot and baseline_path.exists():
         all_frames.append(pd.read_csv(baseline_path))
-    else:
+    elif not pilot:
         print("Fitting non-sequential controls", flush=True)
         matrix = build_interaction_matrix(histories.original, len(movie_ids))
         for groups in (histories.fully_shuffled, histories.recent_context_fixed):
@@ -386,90 +507,160 @@ def run(smoke=False, name=None):
         all_frames.append(baselines)
         del matrix, neighbors, svd, embeddings
 
-    tuning_path = output / "selected_parameters.json"
-    selected = json.loads(tuning_path.read_text()) if tuning_path.exists() else {}
-    for kind in ("fpmc", "sasrec", "lstm"):
-        if kind in selected:
-            continue
-        print(f"Validation tuning: {kind}", flush=True)
-        if kind == "fpmc":
-            epochs = 1 if smoke else 3
-            model = FPMC(len(users), len(movie_ids), 24, .03, .002, 760, 17760).fit(histories.training, epochs)
-            candidates = []
-            for weight in (.5, 1.):
-                score = evaluate(validation, fpmc_scorer(model, histories.training, weight)).ndcg_10.mean()
-                candidates.append({"transition_weight": weight, "epochs": epochs, "factors": 24,
-                                   "validation_ndcg_10": float(score)})
-            selected[kind] = max(candidates, key=lambda p: p["validation_ndcg_10"])
-        else:
-            options = [asdict(SASRecParameters(32, 50, 1, 2, .1, .001)),
-                       asdict(SASRecParameters(64, 100, 2, 4, .2, .0005))] if kind == "sasrec" else [{"learning_rate": .001}]
-            if smoke:
-                options = options[:1]
-            candidates = []
-            for index, parameters in enumerate(options):
-                model, curve, epoch, score = train_neural(kind, histories.training, len(movie_ids), parameters,
-                    protocol["maximum_neural_epochs"], f"{kind}_tuning_{index}", validation)
-                pd.DataFrame(curve).to_csv(output / f"{kind}_tuning_{index}_curve.csv", index=False)
-                candidates.append({"parameters": parameters, "epochs": epoch, "validation_ndcg_10": score})
-            selected[kind] = max(candidates, key=lambda p: p["validation_ndcg_10"])
-        write_json(output / f"{kind}_validation_candidates.json", candidates)
-        write_json(tuning_path, selected)
-        del model
-
-    conditions = [(ORIGINAL, None, histories.original)]
-    for seed in protocol["shuffle_seeds"]:
-        conditions.extend([(FULL_SHUFFLE, seed, histories.fully_shuffled[seed]),
-                           (RECENT_FIXED, seed, histories.recent_context_fixed[seed])])
-    for kind in ("fpmc", "sasrec", "lstm"):
-        choice = selected[kind]
-        for condition, seed, sequences in conditions:
-            label = f"{kind}_{condition}_{seed}"
-            path = output / f"{label}_metrics.csv"
-            if path.exists():
-                frame = pd.read_csv(path)
-                if frame.user_id.tolist() != users.tolist() or not np.isfinite(frame[list(METRICS)]).all().all():
-                    raise ValueError(f"Invalid cached result: {path}")
-                all_frames.append(frame)
+    multiple_initializations = len(initialization_seeds) > 1
+    condition_sequences = {
+        ORIGINAL: {None: histories.original},
+        FULL_SHUFFLE: histories.fully_shuffled,
+        RECENT_FIXED: histories.recent_context_fixed,
+    }
+    conditions = [
+        (condition, shuffle_seed, condition_sequences[condition][shuffle_seed])
+        for _, condition, shuffle_seed in condition_grid([760], protocol["shuffle_seeds"], pilot)
+    ]
+    for initialization_seed in initialization_seeds:
+        suffix = f"_init{initialization_seed}" if multiple_initializations else ""
+        tuning_path = output / f"selected_parameters{suffix}.json"
+        selected = json.loads(tuning_path.read_text()) if tuning_path.exists() else {}
+        for kind in ("fpmc", "sasrec", "lstm"):
+            runtime_key = (kind, initialization_seed)
+            if kind in selected:
+                model_runtime[runtime_key] = {"tuning_seconds": 0.0, "condition_seconds": 0.0}
                 continue
-            print(f"Training {label} for {choice['epochs']} epochs", flush=True)
-            run_started = time.perf_counter()
+            tuning_started = time.perf_counter()
+            print(f"Validation tuning: {kind}, initialization {initialization_seed}", flush=True)
             if kind == "fpmc":
-                model = FPMC(len(users), len(movie_ids), choice["factors"], .03, .002, 760, 17760).fit(sequences, choice["epochs"])
-                scorer = fpmc_scorer(model, sequences, choice["transition_weight"])
+                epochs = 1 if smoke else 3
+                model = FPMC(len(users), len(movie_ids), 24, .03, .002,
+                             initialization_seed, 17000 + initialization_seed).fit(histories.training, epochs)
+                candidates = []
+                for weight in (.5, 1.):
+                    score = evaluate(validation, fpmc_scorer(model, histories.training, weight)).ndcg_10.mean()
+                    candidates.append({"transition_weight": weight, "epochs": epochs, "factors": 24,
+                                       "validation_ndcg_10": float(score)})
+                selected[kind] = max(candidates, key=lambda p: p["validation_ndcg_10"])
+                if pilot:
+                    diagnostic = fpmc_rank_diagnostics(
+                        validation, fpmc_scorer(model, histories.training,
+                                                selected[kind]["transition_weight"]),
+                        training_movie_ids,
+                    )
+                    diagnostic.to_csv(output / f"fpmc_validation_rank_diagnostics{suffix}.csv", index=False)
             else:
-                model, curve, _, _ = train_neural(kind, sequences, len(movie_ids), choice["parameters"], choice["epochs"], label)
-                pd.DataFrame(curve).to_csv(output / f"{label}_curve.csv", index=False)
-                length = choice["parameters"].get("max_sequence_length", 64)
-                scorer = neural_scorer(model, sequences, kind, length)
-            frame = store(evaluate(test, scorer), kind, condition, seed, path)
-            all_frames.append(frame)
-            write_json(output / f"{label}_runtime.json", {"seconds": time.perf_counter() - run_started})
-            if kind != "fpmc":
-                torch.save(model.state_dict(), output / f"{label}.pt")
-            del model, scorer
+                options = [asdict(SASRecParameters(32, 50, 1, 2, .1, .001)),
+                           asdict(SASRecParameters(64, 100, 2, 4, .2, .0005))] if kind == "sasrec" else [{"learning_rate": .001}]
+                if smoke:
+                    options = options[:1]
+                candidates = []
+                for index, parameters in enumerate(options):
+                    label = f"{kind}_tuning_{index}{suffix}"
+                    model, curve, epoch, score = train_neural(
+                        kind, histories.training, len(movie_ids), parameters,
+                        protocol["maximum_neural_epochs"], label, validation,
+                        initialization_seed=initialization_seed,
+                    )
+                    pd.DataFrame(curve).to_csv(output / f"{label}_curve.csv", index=False)
+                    candidates.append({"parameters": parameters, "epochs": epoch, "validation_ndcg_10": score})
+                selected[kind] = max(candidates, key=lambda p: p["validation_ndcg_10"])
+            write_json(output / f"{kind}_validation_candidates{suffix}.json", candidates)
+            write_json(tuning_path, selected)
+            model_runtime[runtime_key] = {"tuning_seconds": time.perf_counter() - tuning_started,
+                                          "condition_seconds": 0.0}
+            del model
+        for kind in ("fpmc", "sasrec", "lstm"):
+            choice = selected[kind]
+            for condition, shuffle_seed, sequences in conditions:
+                label = f"{kind}_{condition}_{shuffle_seed}{suffix}"
+                path = output / f"{label}_metrics.csv"
+                if path.exists():
+                    frame = pd.read_csv(path)
+                    if (frame.user_id.tolist() != users.tolist()
+                            or not np.isfinite(frame[list(METRICS)]).all().all()
+                            or not frame.model_initialization_seed.eq(initialization_seed).all()
+                            or not frame.model_name.eq(kind).all()
+                            or not frame.order_condition.eq(condition).all()
+                            or not (frame.sequence_shuffle_seed.isna().all() if shuffle_seed is None
+                                    else frame.sequence_shuffle_seed.eq(shuffle_seed).all())):
+                        raise ValueError(f"Invalid cached result: {path}")
+                    all_frames.append(frame)
+                    continue
+                print(f"Training {label} for {choice['epochs']} epochs", flush=True)
+                run_started = time.perf_counter()
+                if kind == "fpmc":
+                    model = FPMC(len(users), len(movie_ids), choice["factors"], .03, .002,
+                                 initialization_seed, 17000 + initialization_seed).fit(sequences, choice["epochs"])
+                    scorer = fpmc_scorer(model, sequences, choice["transition_weight"])
+                else:
+                    model, curve, _, _ = train_neural(
+                        kind, sequences, len(movie_ids), choice["parameters"], choice["epochs"],
+                        label, initialization_seed=initialization_seed,
+                    )
+                    pd.DataFrame(curve).to_csv(output / f"{label}_curve.csv", index=False)
+                    length = choice["parameters"].get("max_sequence_length", 64)
+                    scorer = neural_scorer(model, sequences, kind, length)
+                frame = store(evaluate(test, scorer), kind, condition, shuffle_seed, path,
+                              initialization_seed)
+                all_frames.append(frame)
+                if pilot and kind == "fpmc":
+                    diagnostic = fpmc_rank_diagnostics(test, scorer, training_movie_ids)
+                    diagnostic.to_csv(output / f"{label}_rank_diagnostics.csv", index=False)
+                condition_seconds = time.perf_counter() - run_started
+                model_runtime[(kind, initialization_seed)]["condition_seconds"] += condition_seconds
+                write_json(output / f"{label}_runtime.json", {"seconds": condition_seconds})
+                if kind != "fpmc":
+                    torch.save(model.state_dict(), output / f"{label}.pt")
+                del model, scorer
     per_user = pd.concat(all_frames, ignore_index=True)
-    expected = len(users) * (3 + 3 * len(conditions))
-    if len(per_user) != expected or per_user.duplicated(["user_id", "model_name", "order_condition", "sequence_shuffle_seed"]).any():
+    expected = len(users) * ((0 if pilot else 3) + 3 * len(conditions) * len(initialization_seeds))
+    if len(per_user) != expected or per_user.duplicated(
+        ["user_id", "model_name", "order_condition", "model_initialization_seed", "sequence_shuffle_seed"]
+    ).any():
         raise AssertionError("Incomplete or duplicate result grid")
+    expected_cells = {
+        (initialization_seed, kind, condition, shuffle_seed)
+        for initialization_seed, condition, shuffle_seed in condition_grid(
+            initialization_seeds, protocol["shuffle_seeds"], pilot
+        )
+        for kind in ("fpmc", "sasrec", "lstm")
+    }
+    if not pilot:
+        expected_cells.update((760, kind, "order_invariant", None)
+                              for kind in ("popularity", "item_knn", "matrix_factorization"))
+    actual_cells = {
+        (int(initialization_seed), kind, condition,
+         None if pd.isna(shuffle_seed) else int(shuffle_seed))
+        for initialization_seed, kind, condition, shuffle_seed in per_user[
+            ["model_initialization_seed", "model_name", "order_condition", "sequence_shuffle_seed"]
+        ].itertuples(index=False, name=None)
+    }
+    if actual_cells != expected_cells:
+        raise AssertionError("Missing or unexpected initialization/shuffle cells")
     per_user.to_csv(output / "per_user_metrics.csv", index=False)
-    aggregate, effects = summarize(per_user, output, smoke)
+    aggregate, effects = summarize(per_user, output, smoke,
+                                   (FULL_SHUFFLE,) if pilot else (FULL_SHUFFLE, RECENT_FIXED))
+    pd.DataFrame([
+        {"model_name": kind, "model_initialization_seed": initialization_seed, **times,
+         "total_seconds": times["tuning_seconds"] + times["condition_seconds"]}
+        for (kind, initialization_seed), times in model_runtime.items()
+    ]).to_csv(output / "model_runtime.csv", index=False)
     if protected_snapshot() != protected:
         raise AssertionError("Protected MovieLens file hashes changed")
     write_json(output / "completion.json", {
-        "complete": True, "smoke_test": smoke, "users": len(users),
+        "complete": True, "smoke_test": smoke, "pilot": pilot, "users": len(users),
+        **seed_metadata(initialization_seeds, protocol["shuffle_seeds"]),
         "catalog_items": len(movie_ids), "rows": len(per_user),
         "this_invocation_seconds": time.perf_counter() - started,
         "movielens_files_unchanged": True, "protected_files": len(protected),
         "platform": platform.platform(), "torch": torch.__version__, "numpy": np.__version__,
         "device": "cpu", "torch_threads": torch.get_num_threads(),
         "rss_gib_at_completion": psutil.Process().memory_info().rss / 1024**3,
-        "git_branch": subprocess.check_output(["git", "branch", "--show-current"], cwd=ROOT, text=True).strip(),
+        "peak_process_rss_bytes": int(getattr(psutil.Process().memory_info(), "peak_wset",
+                                               psutil.Process().memory_info().rss)),
+        "git_branch": current_git_branch(),
     })
     lines = ["# MovieTweetings order experiment", "",
-             "SMOKE TEST - NOT FINAL" if smoke else "Completed full eligible-user evaluation", "",
+             "MEDIUM PILOT - NON-SCIENTIFIC" if pilot else "SMOKE TEST - NOT FINAL" if smoke else "Completed full eligible-user evaluation", "",
              f"Users: {len(users):,}; catalog: {len(movie_ids):,}; positive threshold: >=8.",
-             "Initialization: 760. Three shuffle seeds in formal runs. No MovieLens files changed.", "",
+             f"Initializations: {initialization_seeds}. Shuffle seeds: {protocol['shuffle_seeds']}. No MovieLens files changed.", "",
              "## NDCG@10", "", "| Model | Condition | NDCG@10 |", "|---|---|---:|"]
     lines.extend(f"| {r.model_name} | {r.order_condition} | {r.ndcg_10:.6f} |" for r in aggregate.itertuples())
     lines += ["", "## Original minus intervention", "", "| Model | Intervention | Difference | 95% CI |", "|---|---|---:|---|"]
@@ -495,13 +686,19 @@ def run(smoke=False, name=None):
     print(f"COMPLETE: {output}", flush=True)
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--name")
-    args = parser.parse_args()
+    parser.add_argument("--pilot-users", type=int)
+    parser.add_argument("--initialization-seeds", type=parse_initialization_seeds)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     with threadpool_limits(limits=1):
-        run(args.smoke, args.name)
+        run(args.smoke, args.name, args.pilot_users, args.initialization_seeds)
 
 
 if __name__ == "__main__":

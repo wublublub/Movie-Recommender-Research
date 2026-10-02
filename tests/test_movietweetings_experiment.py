@@ -13,7 +13,9 @@ from movie_recommender.ml1m_revised_sequence_feasibility import (
     pad_sequences, revised_chronological_split, set_ranking_metrics,
 )
 from movie_recommender.movietweetings_experiment import (
-    block_item_knn, compact_sets, evaluate, fpmc_scorer, lstm_valid_logits, neural_scorer, top_metrics,
+    block_item_knn, build_parser, compact_sets, condition_grid, current_git_branch,
+    evaluate, fpmc_rank_diagnostics, fpmc_scorer, lstm_valid_logits, neural_scorer,
+    parse_initialization_seeds, run, seed_metadata, summarize, top_metrics,
 )
 
 
@@ -114,3 +116,120 @@ def test_batched_fpmc_scores_match_existing_model():
     actual = fpmc_scorer(model, sequences, .5)(0, 2)
     reference = np.stack([model.score(u, int(s[-1]), np.arange(40), .5) for u, s in enumerate(sequences)])
     np.testing.assert_allclose(actual, reference, atol=1e-7, rtol=1e-5)
+
+
+def test_pilot_limit_rejects_smoke_and_large_runs_before_writing() -> None:
+    with pytest.raises(ValueError, match="Pilot requires"):
+        run(smoke=True, pilot_users=400)
+    with pytest.raises(ValueError, match="Pilot requires"):
+        run(pilot_users=1501)
+
+
+def test_primary_only_summary_does_not_require_recent_fixed(tmp_path) -> None:
+    rows = []
+    for model_name in ("fpmc", "lstm", "sasrec"):
+        for user_id in (1, 2):
+            for condition, ndcg in (("original_order", 0.2),
+                                    ("fully_shuffled_pretest", 0.1)):
+                rows.append({"user_id": user_id, "model_name": model_name,
+                             "order_condition": condition, "ndcg_10": ndcg,
+                             "model_initialization_seed": 760,
+                             "sequence_shuffle_seed": 20760 if condition != "original_order" else np.nan,
+                             "precision_10": 0.0, "recall_10": 0.0,
+                             "hit_rate_10": 0.0, "mrr_10": 0.0, "map_10": 0.0})
+
+    _, effects = summarize(pd.DataFrame(rows), tmp_path, False,
+                           ("fully_shuffled_pretest",))
+
+    assert len(effects) == 3
+    assert effects["mean_paired_difference"].tolist() == pytest.approx([0.1] * 3)
+
+
+def test_initialization_seed_cli_and_cartesian_grid() -> None:
+    assert build_parser().parse_args([]).initialization_seeds is None
+    assert parse_initialization_seeds(None) == [760]
+    assert build_parser().parse_args(["--initialization-seeds", "760,761"]).initialization_seeds == [760, 761]
+    with pytest.raises(ValueError, match="distinct"):
+        parse_initialization_seeds("760,760")
+    with pytest.raises(ValueError, match="comma-separated"):
+        parse_initialization_seeds("760,nope")
+    grid = condition_grid([760, 761], [20760, 20761], True)
+    assert len(grid) == 6
+    assert set(grid) == {
+        (760, "original_order", None), (761, "original_order", None),
+        (760, "fully_shuffled_pretest", 20760), (760, "fully_shuffled_pretest", 20761),
+        (761, "fully_shuffled_pretest", 20760), (761, "fully_shuffled_pretest", 20761),
+    }
+    formal_grid = condition_grid([760, 761], [20760, 20761, 20762], False)
+    assert len(formal_grid) == 14
+    assert len(set(formal_grid)) == 14
+    assert all(sum(row[0] == seed for row in formal_grid) == 7 for seed in (760, 761))
+    assert seed_metadata([760, 761], [20760, 20761]) == {
+        "initialization_seeds": [760, 761], "shuffle_seeds": [20760, 20761],
+    }
+
+
+def test_multi_initialization_summary_pairs_within_seed(tmp_path) -> None:
+    rows = []
+    for model_name in ("fpmc", "lstm", "sasrec"):
+        for initialization_seed in (760, 761):
+            for user_id in (1, 2):
+                for condition, ndcg in (("original_order", 0.2 + initialization_seed - 760),
+                                        ("fully_shuffled_pretest", 0.1 + initialization_seed - 760)):
+                    rows.append({"user_id": user_id, "model_name": model_name,
+                                 "order_condition": condition, "ndcg_10": ndcg,
+                                 "model_initialization_seed": initialization_seed,
+                                 "sequence_shuffle_seed": 20760 if condition != "original_order" else np.nan,
+                                 "precision_10": 0., "recall_10": 0., "hit_rate_10": 0.,
+                                 "mrr_10": 0., "map_10": 0.})
+    _, effects = summarize(pd.DataFrame(rows), tmp_path, False, ("fully_shuffled_pretest",))
+    assert effects.mean_paired_difference.tolist() == pytest.approx([0.1] * 3)
+    seed_effects = pd.read_csv(tmp_path / "shuffle_seed_effects.csv")
+    assert set(seed_effects.initialization_seed) == {760, 761}
+    assert len(seed_effects) == 6
+    by_initialization = pd.read_csv(tmp_path / "aggregate_metrics_by_initialization.csv")
+    assert len(by_initialization) == 12
+    assert set(by_initialization.model_initialization_seed) == {760, 761}
+    assert effects.initialization_count.tolist() == [2, 2, 2]
+    assert effects.uncertainty.str.contains("hierarchical").all()
+
+
+def test_git_completion_metadata_uses_local_safe_directory(monkeypatch) -> None:
+    def fake_check_output(command, **kwargs):
+        from movie_recommender.movietweetings_experiment import ROOT
+        assert command[1:3] == ["-c", f"safe.directory={ROOT.as_posix()}"]
+        assert command[-2:] == ["branch", "--show-current"]
+        return "codex/movietweetings-integration\n"
+
+    monkeypatch.setattr("movie_recommender.movietweetings_experiment.subprocess.check_output", fake_check_output)
+    assert current_git_branch() == "codex/movietweetings-integration"
+
+
+def test_fpmc_training_and_rank_diagnostics_update_factors() -> None:
+    sequences = [np.array([0, 1, 2, 3]), np.array([4, 5, 6, 7])]
+    model = FPMC(2, 20, 4, .03, .002, 760, 17760)
+    preference_before = model.item_preference_factors.copy()
+    transitions_before = model.next_item_factors.copy()
+    model.fit(sequences, 1)
+    assert np.any(model.item_preference_factors[[1, 2, 3, 5, 6, 7]] != preference_before[[1, 2, 3, 5, 6, 7]])
+    assert np.any(model.next_item_factors[[1, 2, 3, 5, 6, 7]] != transitions_before[[1, 2, 3, 5, 6, 7]])
+    sets = type("Sets", (), {"movie_ids": np.arange(20), "user_ids": np.array([10, 11]),
+                            "excluded": [np.array([0]), np.array([4])],
+                            "targets": [np.array([3]), np.array([7])]})()
+    diagnostics = fpmc_rank_diagnostics(sets, fpmc_scorer(model, sequences, 1.), {3})
+    assert len(diagnostics) == 2
+    assert diagnostics.all_candidate_scores_finite.all()
+    assert diagnostics.candidate_score_std.gt(0).all()
+    assert diagnostics.warm_in_global_training.tolist() == [True, False]
+    assert diagnostics["rank"].between(1, 19).all()
+
+
+def test_fpmc_rank_diagnostics_respects_exclusion_and_id_ties() -> None:
+    movie_ids = np.arange(10, 22)
+    sets = type("Sets", (), {"movie_ids": movie_ids, "user_ids": np.array([7]),
+                            "excluded": [np.array([0])], "targets": [np.array([2])]})()
+    scores = np.array([[100., 6., 5., 5., 0., 0., 0., 0., 0., 0., 0., 0.]])
+    diagnostics = fpmc_rank_diagnostics(sets, lambda start, end: scores[start:end], {12})
+    assert diagnostics.target_movie_id.tolist() == [12]
+    assert diagnostics["rank"].tolist() == [2]
+    assert diagnostics.candidate_count.tolist() == [11]
