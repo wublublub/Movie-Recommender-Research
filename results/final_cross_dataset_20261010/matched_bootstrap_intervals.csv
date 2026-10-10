@@ -1,0 +1,13 @@
+population,model_name,effect,mean_effect,ci_95_lower,ci_95_upper,bootstrap_replicates,bootstrap_unit
+matched_subset_primary,fpmc,delta_local,0.013788831348910797,0.01225365200975358,0.015407175210349643,5000,paired users with resampled initialization and perturbation seed clusters
+matched_subset_primary,fpmc,delta_broad,0.006743841516380256,0.0057870136040738766,0.0077790182142669344,5000,paired users with resampled initialization and perturbation seed clusters
+matched_subset_primary,fpmc,delta_full,0.02160143782297873,0.019786051325648132,0.023491947251975384,5000,paired users with resampled initialization and perturbation seed clusters
+matched_subset_primary,fpmc,broad_minus_local,0.007044989832530542,0.005780295235589851,0.008359794273389917,5000,paired users with resampled initialization and perturbation seed clusters
+matched_subset_primary,lstm,delta_local,0.005794775986118854,0.00258049210517142,0.009007938977971358,5000,paired users with resampled initialization and perturbation seed clusters
+matched_subset_primary,lstm,delta_broad,0.003292182850369834,0.0010038101868179374,0.0059945553063719265,5000,paired users with resampled initialization and perturbation seed clusters
+matched_subset_primary,lstm,delta_full,0.010432033856522346,0.005616130960869338,0.014779250640043247,5000,paired users with resampled initialization and perturbation seed clusters
+matched_subset_primary,lstm,broad_minus_local,0.00250259313574902,0.0007396284084911363,0.004768003694000118,5000,paired users with resampled initialization and perturbation seed clusters
+matched_subset_primary,sasrec,delta_local,-9.986653817776113e-05,-0.0007718760707798811,0.0005100867127156443,5000,paired users with resampled initialization and perturbation seed clusters
+matched_subset_primary,sasrec,delta_broad,0.00037731684085197213,-0.00023627889810773578,0.0010843010870359169,5000,paired users with resampled initialization and perturbation seed clusters
+matched_subset_primary,sasrec,delta_full,0.001337822662153911,0.0001131098770528946,0.002722303583776844,5000,paired users with resampled initialization and perturbation seed clusters
+matched_subset_primary,sasrec,broad_minus_local,-0.0004771833790297334,-0.0010742116657384885,0.00012147504288912727,5000,paired users with resampled initialization and perturbation seed clusters

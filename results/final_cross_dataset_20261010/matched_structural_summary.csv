@@ -1,0 +1,14 @@
+,mean
+local_kendall_distance,0.10075245792669549
+broad_kendall_distance,0.10093312694436876
+pair_kendall_mismatch,0.0003385818014785081
+local_preserved_adjacency_rate,0.16219962384656575
+local_normalized_displacement,0.08525637651233439
+local_rank_correlation,0.9430720021523266
+local_fixed_position_rate,0.19538866264294358
+local_effectively_unchanged,0.0
+broad_preserved_adjacency_rate,0.8045376184273069
+broad_normalized_displacement,0.10093312694436876
+broad_rank_correlation,0.853227937336893
+broad_fixed_position_rate,0.4848832174680661
+broad_effectively_unchanged,0.0

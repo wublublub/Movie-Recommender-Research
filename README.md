@@ -1,10 +1,10 @@
-# MovieLens 1M Recorded-Order Experiments
+# Recorded-Order Recommender Experiments
 
 This COMPSCI 760 project asks:
 
-> To what extent does the recorded MovieLens rating-submission order contribute to the recommendation performance of sequential recommender systems?
+> How does recorded interaction order affect Top-K performance of sequential recommenders across MovieLens 1M, MovieTweetings, and Foursquare NYC, and does local adjacency or broader sequence arrangement matter more under matched order disruption?
 
-MovieLens timestamps record **rating submission**, not confirmed movie viewing. Results therefore concern the order of positive rating events and must not be described as effects of true viewing order.
+MovieLens and MovieTweetings timestamps record **rating submission**, not confirmed movie viewing. Foursquare timestamps record check-ins. Results concern recorded event order and must not be described as effects of true movie-viewing order.
 
 ## Primary workflow
 
@@ -22,11 +22,12 @@ Popularity, ItemKNN, and TruncatedSVD matrix factorization are order-invariant c
 
 ## Repository structure
 
-- `data/raw/ml-1m/`: immutable MovieLens 1M files; ignored by Git
+- `data/raw/`: immutable MovieLens 1M, MovieTweetings, and Foursquare source files; ignored by Git
 - `src/movie_recommender/`: loaders, legacy analyses, and controlled experiment code
 - `tests/`: unit, invariant, causal-attention, synthetic end-to-end, and reproducibility tests
 - `outputs/`: generated experiment artifacts; ignored by Git
 - `results/final_20260916/`: compact, tracked final tables, figures, provenance, and report evidence
+- `results/final_cross_dataset_20261010/`: compact tracked cross-dataset and matched-targeted summary tables
 - `notebooks/`: optional exploratory work, not the source of formal results
 
 ## Experiment design
@@ -178,7 +179,7 @@ The TSMC2014 NYC integration reads the original Latin-1, tab-separated file from
 
 Foursquare uses full-catalog candidates including previously visited venues. Held-out targets retain event multiplicity: metrics average single-target Top-K outcomes across every held-out check-in event, so repeated visits are not collapsed. This differs intentionally from MovieLens's unseen-item, set-target policy.
 
-Run only the bounded pilot until a formal run is explicitly approved:
+The bounded pilot command was:
 
 ```powershell
 $env:PYTHONPATH = "src"
@@ -192,6 +193,61 @@ $env:PYTHONPATH = "src"
   --lstm-batch-size 2
 ```
 
-The non-fast command is documented by `--help` but should not be launched without explicit approval. Parameter candidates are selected on original-order validation only and then frozen for original and shuffled test conditions.
+The five-initialization, three-shuffle-seed formal run is complete in `outputs/foursquare_nyc_order_experiment_formal_20260929/`. To reproduce it in a **new** output directory rather than overwrite the archive:
 
-Use `--user-limit N` for a deterministic medium-scale subset without enabling the architecture and epoch shortcuts associated with `--fast-test`.
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe -m movie_recommender.foursquare_order_experiment `
+  --data-dir data/raw/dataset_tsmc2014 `
+  --output-dir outputs/foursquare_nyc_order_experiment_reproduction `
+  --model-initialization-seeds 760,761,762,763,764 `
+  --sequence-shuffle-seeds 20760,20761,20762 `
+  --maximum-epochs 5 --batch-size 32 --lstm-batch-size 4 `
+  --models fpmc,lstm,sasrec
+```
+
+Parameter candidates are selected on original-order validation only and then frozen for original and shuffled test conditions.
+
+Use `--user-limit N` for a deterministic medium-scale Foursquare subset without enabling the architecture and epoch shortcuts associated with `--fast-test`.
+
+## Completed cross-dataset workflow
+
+Place the pinned MovieTweetings `latest/ratings.dat`, `latest/movies.dat`, root `README.md`, and `LICENSE` under `data/raw/movietweetings/44c525d0c766944910686c60697203cda39305d6/`. The source commit, raw-file hashes, positive-rating threshold (8/10), catalog policy, and model-selection rules are recorded in `MOVIETWEETINGS_PROTOCOL.md` and the formal `protocol.json`. The Foursquare NYC source file is `data/raw/dataset_tsmc2014/dataset_TSMC2014_NYC.txt`; MovieLens setup is above. Raw files and generated checkpoints are not committed.
+
+These commands document the completed workflows. **Use new output names; do not write into archived formal directories.** The MovieTweetings formal runner uses five initialization seeds and three fixed shuffle seeds:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe -m movie_recommender.movietweetings_experiment `
+  --name formal_rating8_5init_reproduction `
+  --initialization-seeds 760,761,762,763,764
+```
+
+The three-dataset explanatory pipeline uses only frozen per-user metrics and original-order pre-test histories; it does not train models. Its 27 features, applicability flags, subgroup analyses, and seed-stability tables are archived in `outputs/sequence_structure_analysis_20261002_v5/`:
+
+```powershell
+.\.venv\Scripts\python.exe -m movie_recommender.sequence_structure_analysis `
+  --output-dir outputs/sequence_structure_analysis_reproduction `
+  --bootstrap-samples 1000 --bootstrap-seed 50760
+```
+
+The structural calibration is a separate no-model step. It selected a normalized Kendall-distance target of 0.10 and 9,287 matched users; its frozen inputs are in `outputs/movietweetings_kendall_calibration_20261003_v6/`:
+
+```powershell
+.\.venv\Scripts\python.exe -m movie_recommender.movietweetings_kendall_calibration `
+  --output-dir outputs/movietweetings_kendall_calibration_reproduction
+```
+
+The matched targeted runner consumes the **archived v6 calibration and formal MovieTweetings outputs**, reuses their Original/Full Shuffle results, and trains only the 90 Local/Broad cells. Reproducing it requires those frozen inputs at the paths recorded in its `run_config.json`:
+
+```powershell
+.\.venv\Scripts\python.exe -m movie_recommender.movietweetings_matched_targeted_experiment preflight
+.\.venv\Scripts\python.exe -m movie_recommender.movietweetings_matched_targeted_experiment run `
+  --output-dir outputs/movietweetings_matched_targeted_reproduction
+```
+
+The archived formal output is `outputs/movietweetings_matched_targeted_formal_20261003/`; it contains the primary 9,287-user effects, paired hierarchical 95% intervals (5,000 replicates), seed-level effects, structural verification, configuration, runtime, and integrity records. Large per-user outputs remain local and Git-ignored. Compact cross-dataset and targeted summaries are tracked in `results/final_cross_dataset_20261010/`. Compare **within-dataset order effects**, not absolute NDCG across datasets. The matched experiment found a larger Local than Broad effect for FPMC and LSTM, but no reliable Local/Broad difference for SASRec; perturbation sensitivity does not identify internal model mechanisms.
+
+## Reproducibility and contributions
+
+The group implemented dataset adapters, controlled FPMC/LSTM/SASRec runners, common ranking evaluation, original-validation-only selection, order perturbations, sequence-feature analysis, structural calibration, paired inference, and tests. Source data and model architectures are external resources; the experiment and analysis code in `src/movie_recommender/` is this project's implementation. MovieLens 1M is from GroupLens, MovieTweetings from `sidooms/MovieTweetings` at pinned commit `44c525d0c766944910686c60697203cda39305d6`, and the Foursquare NYC check-ins from TSMC2014. Consult each dataset's local README/license and `MOVIETWEETINGS_PROTOCOL.md` for provenance. The frozen initialization seeds are 760–764, shuffle/perturbation seeds 20760–20762, and targeted bootstrap seed 30760. Run `\.venv\Scripts\python.exe -m pytest -q` and `\.venv\Scripts\python.exe -m pip check` after setup.
