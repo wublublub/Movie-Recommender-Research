@@ -765,6 +765,126 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def load_movietweetings_artifacts(
+    metric_path: Path, split_path: Path
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Adapt frozen MovieTweetings metrics and original pre-test histories."""
+    for path in (metric_path, split_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"Required MovieTweetings artifact is missing: {path}")
+    metrics = pd.read_csv(metric_path)
+    required_metrics = {
+        "user_id", "model_name", "order_condition", "ndcg_10",
+        "model_initialization_seed", "sequence_shuffle_seed",
+    }
+    missing = required_metrics.difference(metrics.columns)
+    if missing:
+        raise ValueError(f"MovieTweetings metrics are missing columns: {sorted(missing)}")
+    metrics = metrics.loc[metrics["model_name"].isin(MODELS)].copy()
+    required_conditions = {"original_order", "fully_shuffled_pretest"}
+    if not required_conditions.issubset(set(metrics["order_condition"])):
+        raise ValueError("MovieTweetings Original/Fully Shuffled conditions are missing")
+    selected = metrics.loc[metrics["order_condition"].isin(required_conditions)]
+    keys = ["user_id", "model_name", "model_initialization_seed"]
+    original = selected.loc[selected["order_condition"].eq("original_order")]
+    shuffled = selected.loc[selected["order_condition"].eq("fully_shuffled_pretest")]
+    if original.duplicated(keys).any() or shuffled.duplicated(keys + ["sequence_shuffle_seed"]).any():
+        raise ValueError("MovieTweetings contains duplicate Original/Shuffled seed cells")
+    if original["sequence_shuffle_seed"].notna().any() or shuffled["sequence_shuffle_seed"].isna().any():
+        raise ValueError("MovieTweetings shuffle-seed assignments are invalid")
+    if set(original["model_initialization_seed"]) != set(range(760, 765)):
+        raise ValueError("MovieTweetings initialization seeds do not match the frozen run")
+    if set(shuffled["sequence_shuffle_seed"]) != {20760, 20761, 20762}:
+        raise ValueError("MovieTweetings shuffle seeds do not match the frozen run")
+    expected_cells = len(original) * 3
+    if len(shuffled) != expected_cells or not shuffled.groupby(keys).size().eq(3).all():
+        raise ValueError("MovieTweetings Original/Shuffled seed pairing is incomplete")
+    split = pd.read_csv(split_path)
+    required_split = {"UserID", "MovieID", "Timestamp", "_source_order", "split"}
+    missing = required_split.difference(split.columns)
+    if missing:
+        raise ValueError(f"MovieTweetings split is missing columns: {sorted(missing)}")
+    if not set(split["split"]).issubset({"train", "validation", "test"}):
+        raise ValueError("MovieTweetings split has unexpected labels")
+    features = extract_feature_table(split, "MovieTweetings")
+    if features.duplicated("user_id").any() or set(features["user_id"]) != set(original["user_id"]):
+        raise ValueError("MovieTweetings feature users do not match metric users")
+    if not features["unique_item_count"].eq(features["sequence_length"]).all():
+        raise ValueError("MovieTweetings pre-test histories violate the no-repeat property")
+    return metrics.assign(dataset="MovieTweetings"), features
+
+
+def feature_applicability_audit(features: pd.DataFrame) -> pd.DataFrame:
+    """Flag unsupported or degenerate features without changing their values."""
+    unsupported_without_repeats = {
+        "repeat_event_rate", "immediate_repeat_rate", "visits_per_unique_item",
+        "maximum_item_frequency_share", "normalized_item_entropy",
+        "repeated_bigram_rate", "local_transition_concentration",
+        "first_order_conditional_entropy", "local_information_gain",
+        "first_order_supported_transition_rate", "repeated_trigram_rate",
+        "second_order_conditional_entropy", "long_range_gain",
+        "normalized_long_range_gain", "second_order_supported_transition_rate",
+    }
+    records = []
+    for dataset, frame in features.groupby("dataset", sort=True):
+        no_repeats = frame["unique_item_ratio"].eq(1).all()
+        for feature in FEATURE_COLUMNS:
+            values = pd.to_numeric(frame[feature], errors="coerce")
+            finite = values[np.isfinite(values)]
+            reliability_column = (
+                "first_order_entropy_reliable" if feature in {
+                    "first_order_conditional_entropy", "local_information_gain"
+                } else "second_order_entropy_reliable" if feature in {
+                    "second_order_conditional_entropy", "long_range_gain",
+                    "normalized_long_range_gain"
+                } else None
+            )
+            reliable_count = (
+                int(frame[reliability_column].sum()) if reliability_column else None
+            )
+            applicable = (
+                finite.nunique() > 2
+                and not (no_repeats and feature in unsupported_without_repeats)
+                and (reliable_count is None or reliable_count > 0)
+            )
+            concerns = []
+            if finite.nunique() <= 2:
+                concerns.append("constant or nearly constant")
+            if no_repeats and feature in unsupported_without_repeats:
+                concerns.append("no repeated user-item events; mechanical or unsupported")
+            if reliable_count == 0:
+                concerns.append("no users meet transition reliability rule")
+            if feature in EXPLORATORY_FEATURES:
+                concerns.append("exploratory sparse-transition estimate")
+            if feature in {"unique_item_count", "maximum_item_frequency_share"} and no_repeats:
+                concerns.append("deterministic function of sequence length")
+            records.append({
+                "dataset": dataset, "feature": feature, "applicable": bool(applicable),
+                "support_count": int(finite.size), "missing_count": int(values.isna().sum()),
+                "variance": float(finite.var()) if len(finite) > 1 else np.nan,
+                "unique_value_count": int(finite.nunique()),
+                "reliable_user_count": reliable_count,
+                "reliability_concerns": "; ".join(concerns),
+            })
+    return pd.DataFrame.from_records(records)
+
+
+def cross_dataset_feature_comparison(
+    associations: pd.DataFrame, applicability: pd.DataFrame,
+    seed_stability: pd.DataFrame,
+) -> pd.DataFrame:
+    """Present matched feature-model associations and applicability together."""
+    stability = seed_stability.groupby(["dataset", "model_name", "feature"]).agg(
+        finite_seed_count=("spearman_rho", "count"),
+        positive_seed_count=("spearman_rho", lambda values: int((values > 0).sum())),
+        negative_seed_count=("spearman_rho", lambda values: int((values < 0).sum())),
+    ).reset_index()
+    return associations.merge(
+        applicability[["dataset", "feature", "applicable", "support_count", "reliability_concerns"]],
+        on=["dataset", "feature"], validate="many_to_one",
+    ).merge(stability, on=["dataset", "model_name", "feature"], validate="one_to_one")
+
+
 def _load_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     ml_metric_paths = [
         Path("outputs/ml1m_order_experiment_rating4_20260817/per_user_model_metrics.csv"),
@@ -791,6 +911,9 @@ def _load_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         "outputs/foursquare_nyc_order_experiment_formal_20260929/"
         "per_user_model_metrics.csv"
     )
+    movietweetings_dir = Path("outputs/movietweetings_experiment/formal_rating8_5init_20261002")
+    movietweetings_metric_path = movietweetings_dir / "per_user_metrics.csv"
+    movietweetings_split_path = movietweetings_dir / "split_assignments.csv"
     split_paths = {
         "MovieLens 1M": Path(
             "outputs/ml1m_order_robustness_runs_20260817/rating4_ruleA_init761/"
@@ -801,7 +924,10 @@ def _load_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             "split_audit_table.csv"
         ),
     }
-    required_paths = ml_metric_paths + [foursquare_metric_path, *split_paths.values()]
+    required_paths = ml_metric_paths + [
+        foursquare_metric_path, *split_paths.values(),
+        movietweetings_metric_path, movietweetings_split_path,
+    ]
     missing = [str(path) for path in required_paths if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"Required frozen artifacts are missing: {missing}")
@@ -811,40 +937,40 @@ def _load_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     )
     ml_metrics = ml_metrics.loc[ml_metrics["model_name"].isin(MODELS)]
     foursquare_metrics = pd.read_csv(foursquare_metric_path)
+    movietweetings_metrics, movietweetings_features = load_movietweetings_artifacts(
+        movietweetings_metric_path, movietweetings_split_path
+    )
     metrics = pd.concat(
         [
             ml_metrics.assign(dataset="MovieLens 1M"),
             foursquare_metrics.assign(dataset="Foursquare NYC"),
+            movietweetings_metrics,
         ],
         ignore_index=True,
     )
     features = pd.concat(
         [
-            extract_feature_table(pd.read_csv(path), dataset)
-            for dataset, path in split_paths.items()
+            *[
+                extract_feature_table(pd.read_csv(path), dataset)
+                for dataset, path in split_paths.items()
+            ],
+            movietweetings_features,
         ],
         ignore_index=True,
     )
     audit = pd.DataFrame(
         [
             {
-                "dataset": "MovieLens 1M" if "ml1m" in str(path) else "Foursquare NYC",
+                "dataset": (
+                    "MovieLens 1M" if "ml1m" in str(path) else
+                    "MovieTweetings" if "movietweetings" in str(path) else "Foursquare NYC"
+                ),
                 "artifact_type": "per_user_metrics" if "metrics" in path.name else "split_audit",
                 "path": str(path),
                 "file_size_bytes": path.stat().st_size,
                 "sha256": _sha256(path),
             }
             for path in required_paths
-        ]
-        + [
-            {
-                "dataset": "MovieTweetings",
-                "artifact_type": "per_user_metrics",
-                "path": "",
-                "file_size_bytes": 0,
-                "sha256": "",
-                "status": "pending: no machine-readable user-level artifacts in checkout",
-            }
         ]
     )
     return metrics, features, audit
@@ -996,6 +1122,10 @@ def run_analysis(config: AnalysisConfig) -> Path:
     subgroups = subgroup_analysis(features, effects, config)
     contrasts = model_contrast_analysis(features, effects, config)
     seed_robustness = seed_robustness_analysis(features, paired_effects)
+    applicability = feature_applicability_audit(features)
+    comparison = cross_dataset_feature_comparison(
+        associations, applicability, seed_robustness
+    )
 
     tables = {
         "artifact_audit.csv": audit,
@@ -1008,6 +1138,9 @@ def run_analysis(config: AnalysisConfig) -> Path:
         "subgroup_order_effects.csv": subgroups,
         "model_contrast_analysis.csv": contrasts,
         "feature_model_spearman_by_initialization.csv": seed_robustness,
+        "seed_stability.csv": seed_robustness,
+        "feature_applicability.csv": applicability,
+        "cross_dataset_feature_comparison.csv": comparison,
     }
     for filename, table in tables.items():
         table.to_csv(output_dir / filename, index=False)
@@ -1015,8 +1148,8 @@ def run_analysis(config: AnalysisConfig) -> Path:
 
     analysis_config = {
         **asdict(config),
-        "datasets_completed": ["MovieLens 1M", "Foursquare NYC"],
-        "datasets_pending": ["MovieTweetings"],
+        "datasets_completed": ["MovieLens 1M", "MovieTweetings", "Foursquare NYC"],
+        "datasets_pending": [],
         "feature_history": "original-order train + validation events only",
         "dependent_variable": (
             "within initialization seed: original NDCG@10 minus mean fully shuffled "
@@ -1025,6 +1158,7 @@ def run_analysis(config: AnalysisConfig) -> Path:
         "relative_user_effect_policy": "reported only when original NDCG@10 is nonzero",
         "timestamp_note": {
             "MovieLens 1M": "rating-submission time, not confirmed viewing time",
+            "MovieTweetings": "rating-submission time, not confirmed viewing time",
             "Foursquare NYC": "recorded UTC check-in time",
         },
         "entropy_reliability_rule": (
@@ -1049,7 +1183,8 @@ def run_analysis(config: AnalysisConfig) -> Path:
         "notes": [
             "No recommender models were trained or rerun.",
             "No frozen experiment outputs were modified.",
-            "MovieTweetings remains pending because user-level artifacts are absent.",
+            "MovieTweetings uses frozen user metrics and original-order train plus validation history only.",
+            "No-repeat features remain numerically unchanged but are flagged when unsupported.",
             "Entropy and higher-order features are exploratory when transition support is sparse.",
         ],
     }

@@ -8,6 +8,8 @@ from movie_recommender.sequence_structure_analysis import (
     compute_user_order_effects,
     extract_feature_table,
     extract_user_sequence_features,
+    feature_applicability_audit,
+    load_movietweetings_artifacts,
 )
 
 
@@ -143,3 +145,75 @@ def test_bootstrap_is_reproducible() -> None:
     first = bootstrap_mean_interval(values, samples=100, seed=123)
     second = bootstrap_mean_interval(values, samples=100, seed=123)
     assert first == second
+
+
+def test_movietweetings_adapter_preserves_pretest_history_and_pairing(tmp_path) -> None:
+    split_rows = []
+    metric_rows = []
+    for user_id in (17, 29):
+        for index, (movie_id, split) in enumerate(
+            ((10, "train"), (20, "train"), (30, "validation"), (40, "test"))
+        ):
+            split_rows.append({
+                "UserID": user_id, "MovieID": movie_id + user_id,
+                "Timestamp": 100 + index * 60, "_source_order": index,
+                "split": split,
+            })
+        for model in ("fpmc", "lstm", "sasrec"):
+            for initialization_seed in range(760, 765):
+                metric_rows.append({
+                    "user_id": user_id, "model_name": model,
+                    "order_condition": "original_order", "ndcg_10": 0.4,
+                    "model_initialization_seed": initialization_seed,
+                    "sequence_shuffle_seed": np.nan,
+                })
+                for shuffle_seed in (20760, 20761, 20762):
+                    metric_rows.append({
+                        "user_id": user_id, "model_name": model,
+                        "order_condition": "fully_shuffled_pretest", "ndcg_10": 0.1,
+                        "model_initialization_seed": initialization_seed,
+                        "sequence_shuffle_seed": shuffle_seed,
+                    })
+                metric_rows.append({
+                    "user_id": user_id, "model_name": model,
+                    "order_condition": "recent_context_fixed", "ndcg_10": 0.9,
+                    "model_initialization_seed": initialization_seed,
+                    "sequence_shuffle_seed": np.nan,
+                })
+    metric_path = tmp_path / "metrics.csv"
+    split_path = tmp_path / "split.csv"
+    pd.DataFrame(metric_rows).to_csv(metric_path, index=False)
+    pd.DataFrame(split_rows).sample(frac=1, random_state=4).to_csv(split_path, index=False)
+
+    metrics, features = load_movietweetings_artifacts(metric_path, split_path)
+    assert set(features["user_id"]) == {17, 29}
+    assert features["sequence_length"].eq(3).all()
+    assert features["unique_item_ratio"].eq(1).all()
+    assert features["mean_gap_seconds"].eq(60).all()
+    assert set(metrics["order_condition"]) == {
+        "original_order", "fully_shuffled_pretest", "recent_context_fixed"
+    }
+    effects, paired = compute_user_order_effects(metrics, "MovieTweetings")
+    assert len(paired) == 30
+    assert effects["delta_ndcg_10"].to_numpy() == pytest.approx([0.3] * 6)
+    audit = feature_applicability_audit(features)
+    assert not audit.loc[audit["feature"].eq("repeat_event_rate"), "applicable"].any()
+    assert audit.loc[audit["feature"].eq("sequence_length"), "support_count"].iloc[0] == 2
+    assert not audit.loc[audit["feature"].eq("sequence_length"), "applicable"].iloc[0]
+
+
+def test_movietweetings_adapter_rejects_incomplete_shuffle_cells(tmp_path) -> None:
+    metric_path = tmp_path / "metrics.csv"
+    split_path = tmp_path / "split.csv"
+    pd.DataFrame({
+        "user_id": [1, 1], "model_name": ["fpmc", "fpmc"],
+        "order_condition": ["original_order", "fully_shuffled_pretest"],
+        "ndcg_10": [0.4, 0.1], "model_initialization_seed": [760, 760],
+        "sequence_shuffle_seed": [np.nan, 20760],
+    }).to_csv(metric_path, index=False)
+    pd.DataFrame({
+        "UserID": [1, 1], "MovieID": [1, 2], "Timestamp": [1, 2],
+        "_source_order": [0, 1], "split": ["train", "validation"],
+    }).to_csv(split_path, index=False)
+    with pytest.raises(ValueError, match="initialization seeds"):
+        load_movietweetings_artifacts(metric_path, split_path)
