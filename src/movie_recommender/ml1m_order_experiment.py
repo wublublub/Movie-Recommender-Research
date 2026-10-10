@@ -11,6 +11,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -112,8 +113,24 @@ class OrderExperimentConfig:
     bootstrap_samples: int = 1_000
     fast_test: bool = False
     fast_user_limit: int = 120
+    user_limit: int | None = None
     equal_timestamp_ordering_rule: str = "timestamp_movie_id_source"
     models: tuple[str, ...] = ALL_MODELS
+    candidate_policy: str = "unseen"
+    target_semantics: str = "set"
+    dataset_name: str = "MovieLens 1M"
+    interaction_filename: str = "ratings.dat"
+    timestamp_interpretation: str = (
+        "rating-submission time, not confirmed watching time"
+    )
+    fpmc_parameter_options: tuple[tuple[int, int], ...] = ((24, 3),)
+    lstm_parameter_options: tuple[tuple[int, int, int, float], ...] = (
+        (32, 32, 64, 0.001),
+    )
+    sasrec_parameter_options: tuple[tuple[int, int, int, int, float, float], ...] = (
+        (32, 50, 1, 2, 0.1, 0.001),
+        (64, 100, 2, 4, 0.2, 0.0005),
+    )
 
     def __post_init__(self) -> None:
         """Reject empty, duplicate, or unknown model selections."""
@@ -124,6 +141,18 @@ class OrderExperimentConfig:
             raise ValueError("At least one model must be selected")
         if len(set(self.models)) != len(self.models):
             raise ValueError("Model names must be unique")
+        if self.candidate_policy not in {"unseen", "all_items"}:
+            raise ValueError("candidate_policy must be 'unseen' or 'all_items'")
+        if self.target_semantics not in {"set", "events"}:
+            raise ValueError("target_semantics must be 'set' or 'events'")
+        if self.user_limit is not None and self.user_limit < 1:
+            raise ValueError("user_limit must be positive when provided")
+        if not self.fpmc_parameter_options:
+            raise ValueError("At least one FPMC parameter option is required")
+        if not self.lstm_parameter_options:
+            raise ValueError("At least one LSTM parameter option is required")
+        if not self.sasrec_parameter_options:
+            raise ValueError("At least one SASRec parameter option is required")
 
     def serializable(self) -> dict[str, object]:
         """Return JSON-compatible configuration and protocol declarations."""
@@ -136,9 +165,7 @@ class OrderExperimentConfig:
         values["run_kind"] = (
             "non_final_smoke_test" if self.fast_test else "formal_experiment"
         )
-        values["timestamp_interpretation"] = (
-            "rating-submission time, not confirmed watching time"
-        )
+        values["timestamp_interpretation"] = self.timestamp_interpretation
         values["ordering_rule"] = self.equal_timestamp_ordering_rule
         values["primary_outcome"] = (
             "original_order NDCG@10 minus fully_shuffled_pretest NDCG@10"
@@ -175,6 +202,7 @@ def _revised_config(config: OrderExperimentConfig) -> RevisedConfig:
         bootstrap_samples=config.bootstrap_samples,
         fast_test=config.fast_test,
         fast_user_limit=config.fast_user_limit,
+        user_limit=config.user_limit,
         equal_timestamp_ordering_rule=config.equal_timestamp_ordering_rule,
     )
 
@@ -336,6 +364,7 @@ def _evaluate_non_sequential(
             user_ids,
             item_to_index,
             lambda _user, candidates: popularity[candidates],
+            target_semantics=config.target_semantics,
         ),
         evaluate_full_ranker(
             "item_knn",
@@ -346,6 +375,7 @@ def _evaluate_non_sequential(
             .dot(matrix[user].T)
             .toarray()
             .ravel(),
+            target_semantics=config.target_semantics,
         ),
         evaluate_full_ranker(
             "matrix_factorization",
@@ -354,6 +384,7 @@ def _evaluate_non_sequential(
             item_to_index,
             lambda user, candidates: user_embeddings[user]
             @ svd.components_[:, candidates],
+            target_semantics=config.target_semantics,
         ),
     ]
     result = pd.concat(frames, ignore_index=True)
@@ -375,45 +406,47 @@ def _tune_fpmc(
     item_count: int,
     config: OrderExperimentConfig,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
-    factors = 16 if config.fast_test else 24
-    epochs = 1 if config.fast_test else min(3, config.maximum_epochs)
     init_seed = config.model_initialization_seeds[0]
-    model = FPMC(
-        len(user_ids),
-        item_count,
-        factors,
-        0.03,
-        0.002,
-        init_seed,
-        config.negative_sampling_seed,
-    ).fit(histories.training, epochs)
     previous = np.asarray([sequence[-1] for sequence in histories.training])
     rows: list[dict[str, object]] = []
-    for transition_weight in (0.5, 1.0):
-        metrics = evaluate_full_ranker(
-            "fpmc_validation",
-            validation_sets,
-            user_ids,
-            item_to_index,
-            lambda user, candidates, weight=transition_weight: model.score(
-                user, int(previous[user]), candidates, weight
-            ),
-        )
-        rows.append(
-            {
-                "model_name": "fpmc",
-                "parameters": json.dumps(
-                    {
-                        "factors": factors,
-                        "epochs": epochs,
-                        "transition_weight": transition_weight,
-                    }
+    options = config.fpmc_parameter_options[:1] if config.fast_test else config.fpmc_parameter_options
+    for factors, configured_epochs in options:
+        epochs = 1 if config.fast_test else min(configured_epochs, config.maximum_epochs)
+        model = FPMC(
+            len(user_ids),
+            item_count,
+            factors,
+            0.03,
+            0.002,
+            init_seed,
+            config.negative_sampling_seed,
+        ).fit(histories.training, epochs)
+        for transition_weight in (0.5, 1.0):
+            metrics = evaluate_full_ranker(
+                "fpmc_validation",
+                validation_sets,
+                user_ids,
+                item_to_index,
+                lambda user, candidates, weight=transition_weight: model.score(
+                    user, int(previous[user]), candidates, weight
                 ),
-                "validation_ndcg_10": float(metrics["ndcg_10"].mean()),
-                "model_initialization_seed": init_seed,
-                "negative_sampling_seed": config.negative_sampling_seed,
-            }
-        )
+                target_semantics=config.target_semantics,
+            )
+            rows.append(
+                {
+                    "model_name": "fpmc",
+                    "parameters": json.dumps(
+                        {
+                            "factors": factors,
+                            "epochs": epochs,
+                            "transition_weight": transition_weight,
+                        }
+                    ),
+                    "validation_ndcg_10": float(metrics["ndcg_10"].mean()),
+                    "model_initialization_seed": init_seed,
+                    "negative_sampling_seed": config.negative_sampling_seed,
+                }
+            )
     best = max(rows, key=lambda row: float(row["validation_ndcg_10"]))
     parameters = json.loads(str(best["parameters"]))
     return parameters, rows
@@ -489,6 +522,7 @@ def _train_sasrec_controlled(
                 user_ids,
                 item_to_index,
                 lambda user, candidates: scores[user, candidates],
+                target_semantics=config.target_semantics,
             )
             validation_ndcg = float(validation_metrics["ndcg_10"].mean())
             if validation_ndcg > best_score + 1e-5:
@@ -528,10 +562,7 @@ def _tune_sasrec(
     config: OrderExperimentConfig,
     device: torch.device,
 ) -> tuple[SASRecParameters, int, list[dict[str, object]], list[dict[str, object]]]:
-    options = [
-        SASRecParameters(32, 50, 1, 2, 0.1, 0.001),
-        SASRecParameters(64, 100, 2, 4, 0.2, 0.0005),
-    ]
+    options = [SASRecParameters(*values) for values in config.sasrec_parameter_options]
     if config.fast_test:
         options = options[:1]
     validation_rows: list[dict[str, object]] = []
@@ -609,6 +640,7 @@ def _evaluate_fpmc_conditions(
                     candidates,
                     float(parameters["transition_weight"]),
                 ),
+                target_semantics=config.target_semantics,
             )
             metrics["model_name"] = "fpmc"
             metrics["order_condition"] = condition
@@ -662,6 +694,7 @@ def _evaluate_sasrec_conditions(
                 user_ids,
                 item_to_index,
                 lambda user, candidates: scores[user, candidates],
+                target_semantics=config.target_semantics,
             )
             metrics["model_name"] = "sasrec"
             metrics["order_condition"] = condition
@@ -741,6 +774,7 @@ def _train_lstm_controlled(
                 user_ids,
                 item_to_index,
                 lambda user, candidates: score_matrix[user, candidates],
+                target_semantics=config.target_semantics,
             )
             validation_ndcg = float(validation_metrics["ndcg_10"].mean())
             if validation_ndcg > best_score + 1e-5:
@@ -790,36 +824,42 @@ def _tune_lstm(
     device: torch.device,
 ) -> tuple[LSTMParameters, int, list[dict[str, object]], list[dict[str, object]]]:
     """Select the LSTM epoch count on original-order validation data."""
-    parameters = LSTMParameters(
-        embedding_dimension=config.lstm_embedding_dimension,
-        hidden_dimension=config.lstm_hidden_dimension,
-        maximum_sequence_length=config.lstm_maximum_sequence_length,
-        learning_rate=config.lstm_learning_rate,
-    )
-    model, curves, best_epoch, score = _train_lstm_controlled(
-        histories.training,
-        validation_sets,
-        user_ids,
-        item_to_index,
-        item_count,
-        parameters,
-        config,
-        device,
-        config.model_initialization_seeds[0],
-        "lstm_tuning",
-    )
-    del model
-    validation = [
-        {
-            "model_name": "lstm",
-            "parameters": json.dumps(asdict(parameters)),
-            "best_epoch": best_epoch,
-            "validation_ndcg_10": score,
-            "model_initialization_seed": config.model_initialization_seeds[0],
-            "negative_sampling_seed": np.nan,
-        }
-    ]
-    return parameters, best_epoch, validation, curves
+    options = config.lstm_parameter_options[:1] if config.fast_test else config.lstm_parameter_options
+    validation: list[dict[str, object]] = []
+    all_curves: list[dict[str, object]] = []
+    best: tuple[float, LSTMParameters, int] | None = None
+    for index, values in enumerate(options):
+        parameters = LSTMParameters(*values)
+        model, curves, best_epoch, score = _train_lstm_controlled(
+            histories.training,
+            validation_sets,
+            user_ids,
+            item_to_index,
+            item_count,
+            parameters,
+            config,
+            device,
+            config.model_initialization_seeds[0],
+            f"lstm_tuning_{index}",
+        )
+        del model
+        all_curves.extend(curves)
+        validation.append(
+            {
+                "model_name": "lstm",
+                "parameters": json.dumps(asdict(parameters)),
+                "best_epoch": best_epoch,
+                "validation_ndcg_10": score,
+                "model_initialization_seed": config.model_initialization_seeds[0],
+                "negative_sampling_seed": np.nan,
+            }
+        )
+        candidate = (score, parameters, best_epoch)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    if best is None:
+        raise RuntimeError("LSTM tuning produced no candidate")
+    return best[1], best[2], validation, all_curves
 
 
 def _evaluate_lstm_conditions(
@@ -872,6 +912,7 @@ def _evaluate_lstm_conditions(
                 user_ids,
                 item_to_index,
                 lambda user, candidates: scores[user, candidates],
+                target_semantics=config.target_semantics,
             )
             metrics["model_name"] = "lstm"
             metrics["order_condition"] = condition
@@ -973,6 +1014,15 @@ def paired_order_results(
                 "model_initialization_seed": int(init_seed),
                 "sequence_shuffle_seed": int(shuffle_seed),
                 "mean_paired_difference": float(values.mean()),
+                "original_ndcg_10": float(frame["original_ndcg_10"].mean()),
+                "intervention_ndcg_10": float(
+                    frame["intervention_ndcg_10"].mean()
+                ),
+                "relative_order_drop_percent": float(
+                    values.mean() / frame["original_ndcg_10"].mean() * 100
+                )
+                if frame["original_ndcg_10"].mean() != 0
+                else np.nan,
                 "median_paired_difference": float(np.median(values)),
                 "ci_95_lower": lower,
                 "ci_95_upper": upper,
@@ -1017,6 +1067,15 @@ def paired_order_results(
                 "intervention": keys[1],
                 "comparison_level": "per_user_mean_across_configured_seeds",
                 "mean_paired_difference": float(values.mean()),
+                "original_ndcg_10": float(frame["original_ndcg_10"].mean()),
+                "intervention_ndcg_10": float(
+                    frame["intervention_ndcg_10"].mean()
+                ),
+                "relative_order_drop_percent": float(
+                    values.mean() / frame["original_ndcg_10"].mean() * 100
+                )
+                if frame["original_ndcg_10"].mean() != 0
+                else np.nan,
                 "median_paired_difference": float(np.median(values)),
                 "ci_95_lower": lower,
                 "ci_95_upper": upper,
@@ -1145,11 +1204,11 @@ def _minimum_history_sensitivity(
 
 
 def _dataset_metadata(
-    data_dir: Path,
+    config: OrderExperimentConfig,
     ratings: pd.DataFrame,
     checksum_local_file: bool = True,
 ) -> dict[str, object]:
-    ratings_path = data_dir / "ratings.dat"
+    ratings_path = config.data_dir / config.interaction_filename
     checksum = None
     if checksum_local_file and ratings_path.exists():
         digest = hashlib.sha256()
@@ -1158,11 +1217,15 @@ def _dataset_metadata(
                 digest.update(block)
         checksum = digest.hexdigest()
     return {
-        "dataset": "MovieLens 1M",
+        "dataset": config.dataset_name,
+        "interaction_path": str(ratings_path),
+        "interaction_sha256": checksum,
         "ratings_path": str(ratings_path),
         "ratings_sha256": checksum,
+        "interaction_rows": len(ratings),
         "rating_rows": len(ratings),
         "users": int(ratings["UserID"].nunique()),
+        "items_in_interactions": int(ratings["MovieID"].nunique()),
         "movies_in_ratings": int(ratings["MovieID"].nunique()),
     }
 
@@ -1279,13 +1342,13 @@ def _create_report(
         return float(row.iloc[0]["mean"])
 
     lines = [
-        "# Controlled MovieLens 1M Order Experiment",
+        f"# Controlled {config.dataset_name} Order Experiment",
         "",
         f"**Run status:** {'NON-FINAL SMOKE TEST' if config.fast_test else 'FORMAL EXPERIMENT'}",
         "",
         "## Confirmatory primary results",
         "",
-        "The primary outcome is paired user-level original-order NDCG@10 minus fully shuffled pre-test NDCG@10. Positive values favor recorded rating-submission order.",
+        "The primary outcome is paired user-level original-order NDCG@10 minus fully shuffled pre-test NDCG@10. Positive values favor recorded interaction order.",
         "",
     ]
     reported_models = tuple(
@@ -1297,7 +1360,7 @@ def _create_report(
             & statistical["intervention"].eq(FULL_SHUFFLE)
         ].iloc[0]
         lines.append(
-            f"- **{model.upper()}:** original {metric(model, ORIGINAL):.4f}; fully shuffled {metric(model, FULL_SHUFFLE):.4f}; mean paired difference {result['mean_paired_difference']:+.4f} (95% CI {result['ci_95_lower']:+.4f} to {result['ci_95_upper']:+.4f}); standardized effect {result['standardized_effect']:+.3f}; Wilcoxon p={result['wilcoxon_p_value']:.3g}."
+            f"- **{model.upper()}:** original {metric(model, ORIGINAL):.4f}; fully shuffled {metric(model, FULL_SHUFFLE):.4f}; mean paired difference {result['mean_paired_difference']:+.4f} (95% CI {result['ci_95_lower']:+.4f} to {result['ci_95_upper']:+.4f}); relative order drop {result['relative_order_drop_percent']:+.2f}%; standardized effect {result['standardized_effect']:+.3f}; Wilcoxon p={result['wilcoxon_p_value']:.3g}."
         )
     lines.extend(
         [
@@ -1321,7 +1384,7 @@ def _create_report(
             "",
             "## Empirical findings",
             "",
-            f"Non-sequential controls were fit once on order-invariant user-item data. The run used {len(config.sequence_shuffle_seeds)} shuffle seed(s), {len(config.model_initialization_seeds)} model initialization seed(s), and full ranking over unseen catalog items.",
+            f"The run used {len(config.sequence_shuffle_seeds)} shuffle seed(s), {len(config.model_initialization_seeds)} model initialization seed(s), candidate policy `{config.candidate_policy}`, and target semantics `{config.target_semantics}`.",
             "",
             "## Exploratory subgroup findings",
             "",
@@ -1329,13 +1392,12 @@ def _create_report(
             "",
             "## Interpretation",
             "",
-            "These results estimate sensitivity to the recorded ordering of positive rating events. They do not establish effects of true movie-viewing order.",
+            f"These results estimate sensitivity to recorded interaction order. Timestamp interpretation: {config.timestamp_interpretation}.",
             "",
             "## Limitations",
             "",
-            "- Timestamps record rating submission, not confirmed viewing.",
-            "- Equal timestamps are ordered deterministically by MovieID, then source row.",
-            "- Shuffling destroys order but not unobserved confounding in when and why ratings were submitted.",
+            f"- Equal timestamps use deterministic rule `{config.equal_timestamp_ordering_rule}`.",
+            "- Shuffling destroys order but not unobserved confounding in when and why interactions occurred.",
             "- Sensitivity groups and minimum-history summaries are exploratory.",
             f"- Runtime was {runtime_seconds:.1f} seconds on the recorded environment.",
             "",
@@ -1384,6 +1446,17 @@ def run_experiment(
     started_utc = datetime.now(timezone.utc).isoformat()
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    process = psutil.Process()
+    peak_rss_bytes = process.memory_info().rss
+    memory_sampling_finished = threading.Event()
+
+    def sample_memory() -> None:
+        nonlocal peak_rss_bytes
+        while not memory_sampling_finished.wait(0.05):
+            peak_rss_bytes = max(peak_rss_bytes, process.memory_info().rss)
+
+    memory_thread = threading.Thread(target=sample_memory, daemon=True)
+    memory_thread.start()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_num_threads(min(8, os.cpu_count() or 1))
     ratings_frame = load_ml1m_ratings(config.data_dir) if ratings is None else ratings.copy()
@@ -1396,10 +1469,16 @@ def run_experiment(
     item_to_index = {int(item): index for index, item in enumerate(movie_ids)}
     user_ids = split.eligible_users["user_id"].to_numpy(np.int64)
     validation_sets, validation_candidates = build_ranking_sets(
-        split, split.validation_positive, movie_ids
+        split,
+        split.validation_positive,
+        movie_ids,
+        candidate_policy=config.candidate_policy,
     )
     test_sets, test_candidates = build_ranking_sets(
-        split, split.test_positive, movie_ids
+        split,
+        split.test_positive,
+        movie_ids,
+        candidate_policy=config.candidate_policy,
     )
     assert_split_and_candidates(split, validation_sets, test_sets)
     histories = build_order_histories(
@@ -1409,12 +1488,14 @@ def run_experiment(
     result_frames: list[pd.DataFrame] = []
     validation_rows: list[dict[str, object]] = []
     training_curve_frames: list[pd.DataFrame] = []
+    model_runtime_rows: list[dict[str, object]] = []
     selected: dict[str, object] = {}
 
     selected_non_sequential = tuple(
         model for model in NON_SEQUENTIAL_MODELS if model in config.models
     )
     if selected_non_sequential:
+        model_started = time.perf_counter()
         nonseq, nonseq_parameters = _evaluate_non_sequential(
             histories, test_sets, user_ids, item_to_index, len(movie_ids), config
         )
@@ -1428,8 +1509,15 @@ def run_experiment(
                 if name in selected_non_sequential
             }
         )
+        model_runtime_rows.append(
+            {
+                "model_name": "non_sequential_controls",
+                "runtime_seconds": time.perf_counter() - model_started,
+            }
+        )
 
     if "fpmc" in config.models:
+        model_started = time.perf_counter()
         fpmc_parameters, fpmc_validation = _tune_fpmc(
             histories,
             validation_sets,
@@ -1451,8 +1539,15 @@ def run_experiment(
         )
         validation_rows.extend(fpmc_validation)
         selected["fpmc"] = fpmc_parameters
+        model_runtime_rows.append(
+            {
+                "model_name": "fpmc",
+                "runtime_seconds": time.perf_counter() - model_started,
+            }
+        )
 
     if "lstm" in config.models:
+        model_started = time.perf_counter()
         lstm_parameters, lstm_epochs, lstm_validation, lstm_tuning_curves = (
             _tune_lstm(
                 histories,
@@ -1481,8 +1576,15 @@ def run_experiment(
             [pd.DataFrame(lstm_tuning_curves), lstm_final_curves]
         )
         selected["lstm"] = {**asdict(lstm_parameters), "epochs": lstm_epochs}
+        model_runtime_rows.append(
+            {
+                "model_name": "lstm",
+                "runtime_seconds": time.perf_counter() - model_started,
+            }
+        )
 
     if "sasrec" in config.models:
+        model_started = time.perf_counter()
         sasrec_parameters, sasrec_epochs, sasrec_validation, tuning_curves = (
             _tune_sasrec(
                 histories,
@@ -1509,6 +1611,12 @@ def run_experiment(
         validation_rows.extend(sasrec_validation)
         training_curve_frames.extend([pd.DataFrame(tuning_curves), final_curves])
         selected["sasrec"] = {**asdict(sasrec_parameters), "epochs": sasrec_epochs}
+        model_runtime_rows.append(
+            {
+                "model_name": "sasrec",
+                "runtime_seconds": time.perf_counter() - model_started,
+            }
+        )
 
     per_user = pd.concat(result_frames, ignore_index=True)
     _validate_result_rows(per_user, split.eligible_users, config)
@@ -1597,6 +1705,7 @@ def run_experiment(
         "seed_level_results.csv": seed_results,
         "statistical_comparisons.csv": statistics,
         "training_curves.csv": training_curves,
+        "model_runtime.csv": pd.DataFrame(model_runtime_rows),
         "pretest_sensitivity_features.csv": features,
         "sensitivity_group_results.csv": sensitivity,
         "minimum_history_sensitivity.csv": minimum_history,
@@ -1612,9 +1721,9 @@ def run_experiment(
     (output_dir / "dataset_metadata.json").write_text(
         json.dumps(
             _dataset_metadata(
-                config.data_dir,
+                config,
                 ratings_frame,
-                checksum_local_file=ratings is None,
+                checksum_local_file=True,
             ),
             indent=2,
         ),
@@ -1636,6 +1745,11 @@ def run_experiment(
         "split_and_fast_user_sampling": config.split_seed,
     }
     environment["runtime_seconds"] = time.perf_counter() - started
+    memory_sampling_finished.set()
+    memory_thread.join()
+    peak_rss_bytes = max(peak_rss_bytes, process.memory_info().rss)
+    environment["peak_process_rss_bytes"] = peak_rss_bytes
+    environment["peak_process_rss_gib"] = peak_rss_bytes / (1024**3)
     (output_dir / "environment_and_hardware.json").write_text(
         json.dumps(environment, indent=2), encoding="utf-8"
     )

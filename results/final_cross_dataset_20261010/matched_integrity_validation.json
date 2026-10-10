@@ -1,0 +1,16 @@
+{
+  "valid": true,
+  "new_cells_completed": 90,
+  "expected_new_cells": 90,
+  "new_metric_rows": 1014210,
+  "reused_formal_metric_rows": 676140,
+  "matched_metric_rows": 1393050,
+  "matched_users": 9287,
+  "training_users": 11269,
+  "duplicate_metric_cells": 0,
+  "nonfinite_ndcg_rows": 0,
+  "candidate_mismatches": 0,
+  "target_mismatches": 0,
+  "item_multiset_mismatches": 0,
+  "test_leakage_users": 0
+}

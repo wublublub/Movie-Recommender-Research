@@ -20,4 +20,6 @@ models/
 results/*
 !results/final_20260916/
 !results/final_20260916/**
+!results/final_cross_dataset_20261010/
+!results/final_cross_dataset_20261010/**
 outputs/
